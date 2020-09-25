@@ -115,3 +115,4 @@ ENV/
 
 /data
 .vscode/settings.json
+scvi_workspace.code-workspace
