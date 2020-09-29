@@ -313,3 +313,56 @@ class ScviDataLoader:
         sampler = BatchSampler(**self.sampler_kwargs)
         self.data_loader_kwargs.update({"sampler": sampler, "batch_size": None})
         self.data_loader = DataLoader(self.dataset, **self.data_loader_kwargs)
+
+
+class CustomStereoscopeDataLoader(ScviDataLoader):
+    """
+    Scvi Data Loader.
+
+    A `ScviDataLoader` instance is instantiated with a model and a gene_dataset, and
+    as well as additional arguments that for Pytorch's `DataLoader`. A subset of indices can be specified, for
+    purposes such as splitting the data into train/test or labelled/unlabelled (for semi-supervised learning).
+    Each trainer instance of the `Trainer` class can therefore have multiple `ScviDataLoader` instances to train a model.
+    A `ScviDataLoader` instance also comes with methods to compute likelihood and other relevant training metrics.
+
+    Parameters
+    ----------
+    model
+        A model instance from class ``VAE``, ``VAEC``, ``SCANVI``
+    gene_dataset
+        A gene_dataset instance like ``CortexDataset()``
+    shuffle
+        Specifies if a `RandomSampler` or a `SequentialSampler` should be used
+    indices
+        Specifies how the data should be split with regards to train/test or labelled/unlabelled
+    use_cuda
+        Default: ``True``
+    data_loader_kwargs
+        Keyword arguments to passed into the `DataLoader`
+
+    """
+
+    def __init__(
+        self,
+        model,
+        adata: anndata.AnnData,
+        **kwargs,
+    ):
+        super(CustomStereoscopeDataLoader, self).__init__(model, adata, **kwargs)
+
+    @property
+    def _data_and_attributes(self):
+        """
+        Returns dictionary where key is scVI data field and value is its datatype.
+
+        Used by ScviDataset when _get_item_ is called by mapping the keys in the dict
+        to its associated datatype
+        """
+        return {
+            _CONSTANTS.X_KEY: np.float32,
+            _CONSTANTS.BATCH_KEY: np.int64,
+            _CONSTANTS.LOCAL_L_MEAN_KEY: np.float32,
+            _CONSTANTS.LOCAL_L_VAR_KEY: np.float32,
+            _CONSTANTS.LABELS_KEY: np.int64,
+            "ind_x": np.int64
+        }

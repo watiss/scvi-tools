@@ -54,7 +54,7 @@ class scDeconv(nn.Module):
         #####
         # dispersion for negative binomial
         self.px_r = torch.nn.Parameter(torch.randn(n_input))
-        self.W = torch.nn.Parameter(torch.randn(n_input, n_labels))
+        self.W = torch.nn.Parameter(torch.randn(n_input, n_labels)) # n_genes, n_cell types
 
     def get_weights(self, softplus=True) -> torch.Tensor:
         """
@@ -68,6 +68,20 @@ class scDeconv(nn.Module):
         res = self.W
         if softplus:
             res = torch.nn.functional.softplus(res)
+        return res.detach().cpu().numpy()
+
+    def get_dispersion(self, exp=True) -> torch.Tensor:
+        """
+        Returns the (positive) dispersion px_r.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        res = self.px_r
+        if exp:
+            res = torch.exp(res)
         return res.detach().cpu().numpy()
 
     def get_sample_scale(
@@ -115,7 +129,7 @@ class scDeconv(nn.Module):
         return self.inference(x, y, n_samples=n_samples)["px_rate"]
 
     def get_reconstruction_loss(
-        self, x, y, px_rate, px_r, **kwargs
+        self, x, px_rate, px_r, **kwargs
     ) -> torch.Tensor:
         if self.gene_likelihood == "nb":
             reconst_loss = (
@@ -131,9 +145,8 @@ class scDeconv(nn.Module):
         """Helper function used in forward pass."""
         # there are no latent variables to infer, gene expression only depends on y
         px_r = torch.exp(self.px_r)
-
-        px_scale = torch.nn.functional.softplus(self.W)[:, y]
-        library = torch.sum(x, dim=1)
+        px_scale = torch.nn.functional.softplus(self.W)[:, y[:, 0]].T # cells per gene
+        library = torch.sum(x, dim=1, keepdim=True)
         px_rate = library * px_scale
 
         return dict(
@@ -144,7 +157,7 @@ class scDeconv(nn.Module):
         )
 
     def forward(
-        self, x, y
+        self, x, y, ind_x
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns the reconstruction loss and the KL divergences.
@@ -182,10 +195,8 @@ class stDeconv(nn.Module):
     ----------
     n_spots
         Number of input spots
-    weights 
-        Matrix of shape (n_genes, n_labels) containing the dictionnary learned from the scRNA-seq data
-    log_dispersion
-        Vector of shape (n_genes) containing the log-dispersion parameters for the negative binomial distribution
+    params 
+        Tuple of ndarray of shapes [(n_genes, n_labels), (n_genes)] containing the dictionnary and log dispersion parameters
     gene_likelihood
         One of
 
@@ -196,16 +207,15 @@ class stDeconv(nn.Module):
     def __init__(
         self,
         n_spots: int,
-        weights: np.ndarray,
-        log_dispersion: np.ndarray,
+        params: Tuple[np.ndarray],
         gene_likelihood: str = "nb",
     ):
         super().__init__()
         self.gene_likelihood = gene_likelihood
-        self.W = torch.tensor(weights)
-        self.px_r = torch.tensor(log_dispersion)
+        self.W = torch.tensor(params[0])
+        self.px_r = torch.tensor(params[1])
         self.n_spots = n_spots
-        self.n_genes, self.n_labels = weights.shape
+        self.n_genes, self.n_labels = self.W.shape
 
         #####
         #
@@ -257,9 +267,9 @@ class stDeconv(nn.Module):
         eps = torch.nn.functional.softplus(self.eta) # n_genes
 
         # account for gene specific bias and add noise
-        r_hat = torch.cat(beta * w, eps, dim=1) # n_genes, n_labels + 1
+        r_hat = torch.cat([beta.unsqueeze(1) * w, eps.unsqueeze(1)], dim=1) # n_genes, n_labels + 1
         # subsample observations
-        v_ind = v[:, ind_x] # labels + 1, batch_size
+        v_ind = v[:, ind_x[:, 0]] # labels + 1, batch_size
         px_rate = torch.transpose(torch.matmul(r_hat, v_ind), 0, 1) # batch_size, n_genes 
 
         return dict(
@@ -269,7 +279,7 @@ class stDeconv(nn.Module):
         )
 
     def forward(
-        self, x, ind_x,
+        self, x, y, ind_x,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns the reconstruction loss and the KL divergences.
@@ -298,9 +308,7 @@ class stDeconv(nn.Module):
         mean = torch.zeros_like(eta)
         scale = torch.ones_like(eta)
 
-        log_likelihood_prior = Normal(mean, scale).log_prob(eta).sum(
-            dim=1
-        )
+        log_likelihood_prior = Normal(mean, scale).log_prob(eta).sum()
          
         return reconst_loss, 0.0, log_likelihood_prior
 

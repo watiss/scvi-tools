@@ -11,6 +11,8 @@ from .trainer import Trainer
 
 logger = logging.getLogger(__name__)
 
+from ..data_loaders import CustomStereoscopeDataLoader
+
 
 class UnsupervisedTrainer(Trainer):
     """
@@ -216,3 +218,94 @@ class AdapterTrainer(UnsupervisedTrainer):
             super().train(n_epochs, params=self.params, **kwargs)
 
         return min(self.history["elbo_test_set"])
+
+class CustomStereoscopeTrainer(UnsupervisedTrainer):
+    """
+    Class for the training of Stereosope.
+
+    Parameters
+    ----------
+    model
+        A model instance from class ``scDeconv`` or  `stDeconv``
+    adata
+        A registered AnnData object
+    train_size
+        The train size, a float between 0 and 1 representing proportion of dataset to use for training
+        to use Default: ``0.9``.
+    test_size
+        The test size,  a float between 0 and 1 representing proportion of dataset to use for testing
+        to use Default: ``None``, which is equivalent to data not in the train set. If ``train_size`` and ``test_size``
+        do not add to 1 then the remaining samples are added to a ``validation_set``.
+    **kwargs
+        Other keywords arguments from the general Trainer class.
+
+    Other Parameters
+    ----------------
+    normalize_loss
+        A boolean determining whether the loss is divided by the total number of samples used for
+        training. In particular, when the global KL divergence is equal to 0 and the division is performed, the loss
+        for a minibatchis is equal to the average of reconstruction losses and KL divergences on the minibatch.
+        Default: ``None``, which is equivalent to setting False when the model is an instance from class
+        ``AutoZIVAE`` and True otherwise.
+
+    Examples
+    --------
+    >>> gene_dataset = CortexDataset()
+    >>> vae = VAE(gene_dataset.nb_genes, n_batch=gene_dataset.n_batches * False,
+    ... n_labels=gene_dataset.n_labels)
+
+    >>> infer = VariationalInference(gene_dataset, vae, train_size=0.5)
+    >>> infer.train(n_epochs=20, lr=1e-3)
+
+    Notes
+    -----
+    Two parameters can help control the training KL annealing
+    If your applications rely on the posterior quality,
+    (i.e. differential expression, batch effect removal), ensure the number of total
+    epochs (or iterations) exceed the number of epochs (or iterations) used for KL warmup
+    """
+
+    default_metrics_to_monitor = ["elbo"]
+
+    def __init__(
+        self,
+        model,
+        adata: anndata.AnnData,
+        train_size: Union[int, float] = 0.9,
+        test_size: Union[int, float] = None,
+        normalize_loss: bool = None,
+        **kwargs
+    ):
+        train_size = float(train_size)
+        if train_size > 1.0 or train_size <= 0.0:
+            raise ValueError(
+                "train_size needs to be greater than 0 and less than or equal to 1"
+            )
+        super().__init__(model, adata, **kwargs)
+
+
+        # Total size of the dataset used for training
+        # (e.g. training set in this class but testing set in AdapterTrainer).
+        # It used to rescale minibatch losses (cf. eq. (8) in Kingma et al., Auto-Encoding Variational Bayes, ICLR 2014)
+        self.n_samples = 1.0
+
+        self.train_set, self.test_set, self.validation_set = self.train_test_validation(model, adata, train_size, test_size, type_class=CustomStereoscopeDataLoader)
+        self.train_set.to_monitor = ["elbo"]
+        self.test_set.to_monitor = ["elbo"]
+        self.validation_set.to_monitor = ["elbo"]
+        self.n_samples = len(self.train_set.indices)
+
+    def loss(self, tensors: dict):
+        sample_batch = tensors[_CONSTANTS.X_KEY]
+        y = tensors[_CONSTANTS.LABELS_KEY]
+        ind_x = tensors["ind_x"]
+
+        reconst_loss, kl_divergence_local, kl_divergence_global = self.model(
+            sample_batch, y, ind_x
+        )
+        loss = (
+            self.n_samples
+            * torch.mean(reconst_loss + self.kl_weight * kl_divergence_local)
+            + kl_divergence_global
+        )
+        return loss
