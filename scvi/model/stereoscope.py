@@ -4,10 +4,10 @@ from anndata import AnnData
 import numpy as np
 from scvi._compat import Literal
 from scvi.core.modules import scDeconv, stDeconv
-from scvi.core.models import BaseModelClass, VAEMixin
-from scvi.core.trainers import UnsupervisedTrainer, CustomStereoscopeTrainer
-from scvi.core.data_loaders import ScviDataLoader, CustomStereoscopeDataLoader
-from typing import Optional, Sequence
+from scvi.core.models import BaseModelClass
+from scvi.core.trainers import CustomStereoscopeTrainer
+from scvi.core.data_loaders import CustomStereoscopeDataLoader, ScviDataLoader
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -156,6 +156,7 @@ class stStereoscope(BaseModelClass):
             n_spots=st_adata.n_obs,
             params=params,
             gene_likelihood=gene_likelihood,
+            use_cuda=True,
             **model_kwargs,
         )
         self._model_summary_string = (
@@ -165,6 +166,8 @@ class stStereoscope(BaseModelClass):
         )
         self.init_params_ = self._get_init_params(locals())
 
+    def get_proportions(self):
+        return self.model.get_proportions()
 
     def train(self,
         n_epochs: Optional[int] = None,

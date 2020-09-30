@@ -305,7 +305,7 @@ class CustomStereoscopeTrainer(UnsupervisedTrainer):
         )
         loss = (
             self.n_samples
-            * torch.mean(reconst_loss + self.kl_weight * kl_divergence_local)
+            * torch.mean(reconst_loss + kl_divergence_local)
             + kl_divergence_global
         )
         return loss

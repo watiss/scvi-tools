@@ -17,9 +17,10 @@ dataset.obs["indices"] = np.arange(dataset.n_obs)
 register_tensor_from_anndata(dataset, "ind_x", "obs", "indices")
 
 model = scStereoscope(dataset)
-model.train(n_epochs=100)
+model.train(n_epochs=100, frequency=1)
 params = model.get_params()
 
 
 model = stStereoscope(dataset, params)
-model.train(n_epochs=100)
+model.train(n_epochs=100, frequency=1)
+print(model.get_proportions())

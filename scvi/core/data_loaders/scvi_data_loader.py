@@ -350,6 +350,26 @@ class CustomStereoscopeDataLoader(ScviDataLoader):
     ):
         super(CustomStereoscopeDataLoader, self).__init__(model, adata, **kwargs)
 
+    def elbo(self):
+        """
+        Computes log p(x/z), which is the reconstruction error.
+
+        Differs from the marginal log likelihood, but still gives good
+        insights on the modeling of the data, and is fast to compute.
+        """
+        # Iterate once over the data and computes the reconstruction error
+        log_lkl = 0
+        for i_batch, tensors in enumerate(self):
+            sample_batch = tensors[_CONSTANTS.X_KEY]
+            ind_x = tensors["ind_x"]
+            labels = tensors[_CONSTANTS.LABELS_KEY]
+            reconst_loss, local_kl, global_kl = self.model(sample_batch, labels, ind_x)
+            log_lkl += torch.sum(reconst_loss + local_kl).item()
+        n_samples = len(self.indices)
+        if torch.is_tensor(global_kl):
+            log_lkl += global_kl.item()
+        return log_lkl / n_samples
+
     @property
     def _data_and_attributes(self):
         """

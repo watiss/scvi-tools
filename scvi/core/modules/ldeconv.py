@@ -12,7 +12,6 @@ from scvi.core._distributions import (
 )
 
 from typing import Tuple, Dict
-
 torch.backends.cudnn.benchmark = True
 
 
@@ -168,6 +167,8 @@ class scDeconv(nn.Module):
             tensor of values with shape (batch_size, n_input)
         y
             tensor of cell-types labels with shape (batch_size, n_labels)
+        ind_x 
+            tensor of indices (ignored)
 
         Returns
         -------
@@ -209,8 +210,10 @@ class stDeconv(nn.Module):
         n_spots: int,
         params: Tuple[np.ndarray],
         gene_likelihood: str = "nb",
+        use_cuda=True
     ):
         super().__init__()
+        self.use_cuda = use_cuda
         self.gene_likelihood = gene_likelihood
         self.W = torch.tensor(params[0])
         self.px_r = torch.tensor(params[1])
@@ -231,17 +234,23 @@ class stDeconv(nn.Module):
         # additive gene bias
         self.beta = torch.nn.Parameter(torch.randn(self.n_genes))
 
-
-    def get_loadings(self) -> torch.Tensor:
+    def get_proportions(self, keep_noise=False) -> torch.Tensor:
         """
-        Returns the loadings V.
+        Returns the loadings.
 
         Returns
         -------
         type
             tensor
         """
-        return self.V.detach().cpu().numpy()
+        # get estimated unadjusted proportions
+        W  = torch.nn.functional.softplus(self.V).detach().cpu().numpy().T # n_spots, n_labels + 1
+        # remove dummy cell type proportion values
+        if not keep_noise:
+            W = W[:,:-1]
+        # normalize to obtain adjusted proportions
+        W = W / W.sum(axis = 1).reshape(-1,1)
+        return W
 
     def get_reconstruction_loss(
         self, x, px_rate, px_r, **kwargs
@@ -266,6 +275,13 @@ class stDeconv(nn.Module):
         w = torch.nn.functional.softplus(self.W)  # n_genes, n_labels
         eps = torch.nn.functional.softplus(self.eta) # n_genes
 
+        if self.use_cuda:
+            w = w.cuda()
+            px_r = px_r.cuda()
+            eps = eps.cuda()
+            v = v.cuda()
+            beta = beta.cuda()
+
         # account for gene specific bias and add noise
         r_hat = torch.cat([beta.unsqueeze(1) * w, eps.unsqueeze(1)], dim=1) # n_genes, n_labels + 1
         # subsample observations
@@ -288,6 +304,8 @@ class stDeconv(nn.Module):
         ----------
         x
             tensor of values with shape (batch_size, n_input)
+        y
+            tensor of cell types (ignored)
         ind_x
             tensor of indices with shape (batch_size,)
 
@@ -308,7 +326,7 @@ class stDeconv(nn.Module):
         mean = torch.zeros_like(eta)
         scale = torch.ones_like(eta)
 
-        log_likelihood_prior = Normal(mean, scale).log_prob(eta).sum()
+        neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()
          
-        return reconst_loss, 0.0, log_likelihood_prior
+        return reconst_loss, 0.0, neg_log_likelihood_prior
 
