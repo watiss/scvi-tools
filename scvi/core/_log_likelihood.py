@@ -288,6 +288,32 @@ def log_nb_positive(x, mu, theta, eps=1e-8):
 
     return res
 
+def log_nb_positive_altparam(x, r, o, eps=1e-8):
+    """
+    Log likelihood (scalar) of a minibatch according to a nb model.
+
+    Note: All inputs should be torch Tensors
+    Variables:
+    r: positive parameter of the negative binomial (has to be positive support) (shape: minibatch x genes)
+    o: logits for the second parameter (real support) (shape: minibatch x genes)
+    eps: numerical stability constant
+
+    """
+    if o.ndimension() == 1:
+        o = o.view(
+            1, o.size(0)
+        )  # In this case, we reshape o for broadcasting
+
+    res = (
+        r * torch.nn.functional.logsigmoid(-o)
+        + x * torch.nn.functional.logsigmoid(o)
+        + torch.lgamma(x + r + eps)
+        - torch.lgamma(r + eps)
+        - torch.lgamma(x + 1)
+    )
+
+    return res
+
 
 def log_mixture_nb(x, mu_1, mu_2, theta_1, theta_2, pi, eps=1e-8):
     """Note: All inputs should be torch Tensors

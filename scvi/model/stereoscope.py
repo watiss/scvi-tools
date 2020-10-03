@@ -65,7 +65,7 @@ class scStereoscope(BaseModelClass):
         self.init_params_ = self._get_init_params(locals())
 
     def get_params(self):
-        return self.model.get_weights(softplus=False), self.model.get_dispersion(exp=False)
+        return self.model.get_weights(softplus=False), self.model.get_dispersion()
 
     def train(self,
         n_epochs: Optional[int] = None,

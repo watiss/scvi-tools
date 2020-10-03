@@ -11,6 +11,8 @@ from scvi.core._distributions import (
     NegativeBinomial, Poisson
 )
 
+from scvi.core._log_likelihood import log_nb_positive_altparam
+
 from typing import Tuple, Dict
 torch.backends.cudnn.benchmark = True
 
@@ -51,8 +53,8 @@ class scDeconv(nn.Module):
         # x_ng \sim NB(l_n * softplus(W_{g, c_n}), exp(theta))
         #
         #####
-        # dispersion for negative binomial
-        self.px_r = torch.nn.Parameter(torch.randn(n_input))
+        # logit param for negative binomial
+        self.px_o = torch.nn.Parameter(torch.randn(n_input))
         self.W = torch.nn.Parameter(torch.randn(n_input, n_labels)) # n_genes, n_cell types
 
     def get_weights(self, softplus=True) -> torch.Tensor:
@@ -69,18 +71,16 @@ class scDeconv(nn.Module):
             res = torch.nn.functional.softplus(res)
         return res.detach().cpu().numpy()
 
-    def get_dispersion(self, exp=True) -> torch.Tensor:
+    def get_dispersion(self) -> torch.Tensor:
         """
-        Returns the (positive) dispersion px_r.
+        Returns the dispersion px_o.
 
         Returns
         -------
         type
             tensor
         """
-        res = self.px_r
-        if exp:
-            res = torch.exp(res)
+        res = self.px_o
         return res.detach().cpu().numpy()
 
     def get_sample_scale(
@@ -128,11 +128,11 @@ class scDeconv(nn.Module):
         return self.inference(x, y, n_samples=n_samples)["px_rate"]
 
     def get_reconstruction_loss(
-        self, x, px_rate, px_r, **kwargs
+        self, x, px_rate, px_o, **kwargs
     ) -> torch.Tensor:
         if self.gene_likelihood == "nb":
             reconst_loss = (
-                -NegativeBinomial(mu=px_rate, theta=px_r).log_prob(x).sum(dim=-1)
+                -log_nb_positive_altparam(x, px_rate, px_o).sum(dim=-1)
             )
         elif self.gene_likelihood == "poisson":
             reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
@@ -143,14 +143,13 @@ class scDeconv(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Helper function used in forward pass."""
         # there are no latent variables to infer, gene expression only depends on y
-        px_r = torch.exp(self.px_r)
         px_scale = torch.nn.functional.softplus(self.W)[:, y[:, 0]].T # cells per gene
         library = torch.sum(x, dim=1, keepdim=True)
         px_rate = library * px_scale
 
         return dict(
             px_scale=px_scale,
-            px_r=px_r,
+            px_o=self.px_o,
             px_rate=px_rate,
             library=library,
         )
@@ -178,9 +177,9 @@ class scDeconv(nn.Module):
         # Parameters for z latent distribution
         outputs = self.inference(x, y)
         px_rate = outputs["px_rate"]
-        px_r = outputs["px_r"]
+        px_o = outputs["px_o"]
 
-        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_r)
+        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
 
         return reconst_loss, 0.0, 0.0
 
@@ -215,8 +214,9 @@ class stDeconv(nn.Module):
         super().__init__()
         self.use_cuda = use_cuda
         self.gene_likelihood = gene_likelihood
+        # import parameters from sc model
         self.W = torch.tensor(params[0])
-        self.px_r = torch.tensor(params[1])
+        self.px_o = torch.tensor(params[1])
         self.n_spots = n_spots
         self.n_genes, self.n_labels = self.W.shape
 
@@ -232,7 +232,7 @@ class stDeconv(nn.Module):
         # factor loadings
         self.V = torch.nn.Parameter(torch.randn(self.n_labels + 1, self.n_spots))
         # additive gene bias
-        self.beta = torch.nn.Parameter(torch.randn(self.n_genes))
+        self.beta = torch.nn.Parameter(0.1 * torch.randn(self.n_genes))
 
     def get_proportions(self, keep_noise=False) -> torch.Tensor:
         """
@@ -244,20 +244,20 @@ class stDeconv(nn.Module):
             tensor
         """
         # get estimated unadjusted proportions
-        W  = torch.nn.functional.softplus(self.V).detach().cpu().numpy().T # n_spots, n_labels + 1
+        res  = torch.nn.functional.softplus(self.V).detach().cpu().numpy().T # n_spots, n_labels + 1
         # remove dummy cell type proportion values
         if not keep_noise:
-            W = W[:,:-1]
+            res = res[:,:-1]
         # normalize to obtain adjusted proportions
-        W = W / W.sum(axis = 1).reshape(-1,1)
-        return W
+        res = res / res.sum(axis = 1).reshape(-1,1)
+        return res
 
     def get_reconstruction_loss(
-        self, x, px_rate, px_r, **kwargs
+        self, x, px_rate, px_o, **kwargs
     ) -> torch.Tensor:
         if self.gene_likelihood == "nb":
             reconst_loss = (
-                -NegativeBinomial(mu=px_rate, theta=px_r).log_prob(x).sum(dim=-1)
+                -log_nb_positive_altparam(x, px_rate, px_o).sum(dim=-1)
             )
         elif self.gene_likelihood == "poisson":
             reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
@@ -269,7 +269,6 @@ class stDeconv(nn.Module):
         """Helper function used in forward pass."""
         # x_sg \sim NB(softplus(\beta_g) * \sum_{z=1}^Z softplus(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
 
-        px_r = torch.exp(self.px_r) # n_genes
         beta = torch.nn.functional.softplus(self.beta) # n_genes
         v = torch.nn.functional.softplus(self.V) # n_labels + 1, n_spots
         w = torch.nn.functional.softplus(self.W)  # n_genes, n_labels
@@ -277,7 +276,7 @@ class stDeconv(nn.Module):
 
         if self.use_cuda:
             w = w.cuda()
-            px_r = px_r.cuda()
+            px_o = self.px_o.cuda()
             eps = eps.cuda()
             v = v.cuda()
             beta = beta.cuda()
@@ -289,7 +288,7 @@ class stDeconv(nn.Module):
         px_rate = torch.transpose(torch.matmul(r_hat, v_ind), 0, 1) # batch_size, n_genes 
 
         return dict(
-            px_r=px_r,
+            px_o=px_o,
             px_rate=px_rate,
             eta=self.eta
         )
@@ -317,10 +316,10 @@ class stDeconv(nn.Module):
         # Parameters for z latent distribution
         outputs = self.inference(x, ind_x)
         px_rate = outputs["px_rate"]
-        px_r = outputs["px_r"]
+        px_o = outputs["px_o"]
         eta = outputs["eta"]
 
-        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_r)
+        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
 
         # prior likelihood
         mean = torch.zeros_like(eta)
