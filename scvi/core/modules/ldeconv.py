@@ -10,8 +10,11 @@ from torch.distributions import Normal
 from scvi.core._distributions import (
     NegativeBinomial, Poisson
 )
+from typing import Optional, List
+from collections import OrderedDict
 
 from scvi.core._log_likelihood import log_nb_positive_altparam
+from scvi.core.modules._base import FCLayers
 
 from typing import Tuple, Dict
 torch.backends.cudnn.benchmark = True
@@ -286,6 +289,339 @@ class stDeconv(nn.Module):
         # subsample observations
         v_ind = v[:, ind_x[:, 0]] # labels + 1, batch_size
         px_rate = torch.transpose(torch.matmul(r_hat, v_ind), 0, 1) # batch_size, n_genes 
+
+        return dict(
+            px_o=px_o,
+            px_rate=px_rate,
+            eta=self.eta
+        )
+
+    def forward(
+        self, x, y, ind_x,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns the reconstruction loss and the KL divergences.
+
+        Parameters
+        ----------
+        x
+            tensor of values with shape (batch_size, n_input)
+        y
+            tensor of cell types (ignored)
+        ind_x
+            tensor of indices with shape (batch_size,)
+
+        Returns
+        -------
+        type
+            the reconstruction loss and the Kullback divergences
+        """
+        # Parameters for z latent distribution
+        outputs = self.inference(x, ind_x)
+        px_rate = outputs["px_rate"]
+        px_o = outputs["px_o"]
+        eta = outputs["eta"]
+
+        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
+
+        # prior likelihood
+        mean = torch.zeros_like(eta)
+        scale = torch.ones_like(eta)
+
+        neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()
+         
+        return reconst_loss, 0.0, neg_log_likelihood_prior
+
+class stDeconvAmortized(nn.Module):
+    """
+    Linear model for cell-type deconvolution of spatial transcriptomics data.
+
+    This is an re-implementation of the STModel module of stereoscope "https://github.com/almaan/stereoscope/blob/master/stsc/models.py"
+
+    Parameters
+    ----------
+    n_spots
+        Number of input spots
+    params 
+        Tuple of ndarray of shapes [(n_genes, n_labels), (n_genes)] containing the dictionnary and log dispersion parameters
+    gene_likelihood
+        One of
+
+        * ``'nb'`` - Negative binomial distribution
+        * ``'poisson'`` - Poisson distribution
+    """
+
+    def __init__(
+        self,
+        n_spots: int,
+        params: Tuple[np.ndarray],
+        n_hidden: int=128,
+        gene_likelihood: str = "nb",
+        use_cuda=True
+    ):
+        super().__init__()
+        self.use_cuda = use_cuda
+        self.gene_likelihood = gene_likelihood
+        # import parameters from sc model
+        self.W = torch.tensor(params[0])
+        self.px_o = torch.tensor(params[1])
+        # self.n_spots = n_spots
+        self.n_genes, self.n_labels = self.W.shape
+
+        #####
+        #
+        # x_sg \sim NB(\beta_g * \sum_{z=1}^Z exp(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
+        #
+        #####
+        # note, the gamma is included in the V below!
+
+        # noise from data
+        self.eta = torch.nn.Parameter(torch.randn(self.n_genes))
+        # factor loadings via encoding
+        self.encoder_V = FCLayers(
+            n_in=self.n_genes,
+            n_out=self.n_labels + 1,
+            n_layers=2,
+            n_hidden=n_hidden,
+            dropout_rate=0.1,
+        )
+        # additive gene bias
+        self.beta = torch.nn.Parameter(0.1 * torch.randn(self.n_genes))
+
+    def get_proportions(self, x, keep_noise=False) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        # get estimated unadjusted proportions
+        res  = torch.nn.functional.softplus(self.encoder_V(x))
+        # remove dummy cell type proportion values
+        if not keep_noise:
+            res = res[:,:-1]
+        # normalize to obtain adjusted proportions
+        res = res / res.sum(axis = 1).reshape(-1,1)
+        return res
+
+    def get_reconstruction_loss(
+        self, x, px_rate, px_o, **kwargs
+    ) -> torch.Tensor:
+        if self.gene_likelihood == "nb":
+            reconst_loss = (
+                -log_nb_positive_altparam(x, px_rate, px_o).sum(dim=-1)
+            )
+        elif self.gene_likelihood == "poisson":
+            reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
+        return reconst_loss
+
+    def inference(
+        self, x, ind_x,
+    ) -> Dict[str, torch.Tensor]:
+        """Helper function used in forward pass."""
+        # x_sg \sim NB(softplus(\beta_g) * \sum_{z=1}^Z softplus(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
+
+        beta = torch.nn.functional.softplus(self.beta) # n_genes
+        v = self.encoder_V(x)
+        v = torch.nn.functional.softplus(v) # minibatch_size, n_labels + 1
+        w = torch.nn.functional.softplus(self.W)  # n_genes, n_labels
+        eps = torch.nn.functional.softplus(self.eta) # n_genes
+
+        if self.use_cuda:
+            w = w.cuda()
+            px_o = self.px_o.cuda()
+            eps = eps.cuda()
+            v = v.cuda()
+            beta = beta.cuda()
+
+        # account for gene specific bias and add noise
+        r_hat = torch.cat([beta.unsqueeze(1) * w, eps.unsqueeze(1)], dim=1) # n_genes, n_labels + 1
+        # subsample observations
+        px_rate = torch.matmul(v, torch.transpose(r_hat, 0, 1)) # batch_size, n_genes 
+
+        return dict(
+            px_o=px_o,
+            px_rate=px_rate,
+            eta=self.eta
+        )
+
+    def forward(
+        self, x, y, ind_x,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns the reconstruction loss and the KL divergences.
+
+        Parameters
+        ----------
+        x
+            tensor of values with shape (batch_size, n_input)
+        y
+            tensor of cell types (ignored)
+        ind_x
+            tensor of indices with shape (batch_size,)
+
+        Returns
+        -------
+        type
+            the reconstruction loss and the Kullback divergences
+        """
+        # Parameters for z latent distribution
+        outputs = self.inference(x, ind_x)
+        px_rate = outputs["px_rate"]
+        px_o = outputs["px_o"]
+        eta = outputs["eta"]
+
+        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
+
+        # prior likelihood
+        mean = torch.zeros_like(eta)
+        scale = torch.ones_like(eta)
+
+        neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()
+         
+        return reconst_loss, 0.0, neg_log_likelihood_prior
+
+
+class stVAE(nn.Module):
+    """
+    non-linear model for cell-type deconvolution of spatial transcriptomics data.
+
+    Parameters
+    ----------
+    state_dict 
+        state_dict of the decoder of the CondScVI
+    gene_likelihood
+        One of
+
+        * ``'nb'`` - Negative binomial distribution
+        * ``'poisson'`` - Poisson distribution
+    """
+
+    def __init__(
+        self,
+        n_labels: int,
+        state_dict: List[OrderedDict],
+        n_genes:int,
+        n_latent: int=2,
+        n_hidden: int=128,
+        n_layers: int=1,
+        n_batch: int=1,
+        gene_likelihood: str = "nb",
+        use_cuda=True
+    ):
+        super().__init__()
+        self.use_cuda = use_cuda
+        self.gene_likelihood = gene_likelihood
+        self.n_genes = n_genes
+        self.n_latent = n_latent
+        self.n_batch = n_batch
+        self.n_labels = n_labels
+
+        # import parameters from sc model
+        self.decoder = FCLayers(
+            n_in=n_latent,
+            n_out=n_hidden,
+            n_cat_list=[n_batch, n_labels],
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=0.1,
+        )
+        self.px_decoder = nn.Sequential(
+        nn.Linear(n_hidden, n_genes),
+        nn.Softplus()
+        )
+
+        self.decoder.load_state_dict(state_dict[0])
+        self.px_decoder.load_state_dict(state_dict[1])
+
+        # create encoders (for gammas as well as proportions)
+        self.encoder = FCLayers(
+            n_in=n_genes,
+            n_out=n_hidden,
+            n_cat_list=[],
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=0.1,
+        )
+        self.z_encoder = nn.Linear(n_hidden, n_labels + 1)
+        self.gamma_encoder = nn.Linear(n_hidden, n_latent * n_labels)
+ 
+        #####
+        #
+        # x_sg \sim NB(\beta_g * \sum_{z=1}^Z exp(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
+        #
+        #####
+        # note, the gamma is included in the V below!
+
+        # noise from data
+        self.eta = torch.nn.Parameter(torch.randn(self.n_genes))
+        # additive gene bias
+        self.beta = torch.nn.Parameter(0.1 * torch.randn(self.n_genes))
+
+    def get_proportions(self, x, keep_noise=False) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        # get estimated unadjusted proportions
+        h = self.encoder(x)
+        v = self.z_encoder(h)
+        res = torch.nn.functional.softplus(v)
+        # remove dummy cell type proportion values
+        if not keep_noise:
+            res = res[:,:-1]
+        # normalize to obtain adjusted proportions
+        res = res / res.sum(axis = 1).reshape(-1,1)
+        return res
+
+    def get_reconstruction_loss(
+        self, x, px_rate, px_o, **kwargs
+    ) -> torch.Tensor:
+        if self.gene_likelihood == "nb":
+            reconst_loss = (
+                -log_nb_positive_altparam(x, px_rate, px_o).sum(dim=-1)
+            )
+        elif self.gene_likelihood == "poisson":
+            reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
+        return reconst_loss
+
+    def inference(
+        self, x, ind_x,
+    ) -> Dict[str, torch.Tensor]:
+        """Helper function used in forward pass."""
+        # x_sg \sim NB(softplus(\beta_g) * \sum_{z=1}^Z softplus(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
+
+        beta = torch.nn.functional.softplus(self.beta) # n_genes
+        h = self.encoder(x)
+        v = self.z_encoder(h)
+        v = torch.nn.functional.softplus(v) # minibatch_size, n_labels + 1
+
+        gamma = self.gamma_encoder(h) # minibatch_size, n_labels * n_latent
+        gamma = gamma.reshape((-1, self.n_latent))
+
+        enum_label = torch.arange(0, self.n_labels)
+        # repeat, then feed into the encoders
+        # hopefully, get something of shape (minibatch, n_labels, n_genes) and sum product against the proportions
+        w = torch.nn.functional.softplus(self.W)  # n_genes, n_labels
+        eps = torch.nn.functional.softplus(self.eta) # n_genes
+
+        if self.use_cuda:
+            w = w.cuda()
+            px_o = self.px_o.cuda()
+            eps = eps.cuda()
+            v = v.cuda()
+            beta = beta.cuda()
+
+        # account for gene specific bias and add noise
+        r_hat = torch.cat([beta.unsqueeze(1) * w, eps.unsqueeze(1)], dim=1) # n_genes, n_labels + 1
+        # subsample observations
+        px_rate = torch.matmul(v, torch.transpose(r_hat, 0, 1)) # batch_size, n_genes 
 
         return dict(
             px_o=px_o,

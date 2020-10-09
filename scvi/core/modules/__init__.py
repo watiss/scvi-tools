@@ -4,6 +4,7 @@ from .scanvae import SCANVAE
 from .classifier import Classifier
 from .autozivae import AutoZIVAE
 from .jvae import JVAE
-from .ldeconv import scDeconv, stDeconv
+from .ldeconv import scDeconv, stDeconv, stDeconvAmortized
+from .vaec import VAEC
 
-__all__ = ["VAE", "LDVAE", "TOTALVAE", "AutoZIVAE", "SCANVAE", "Classifier", "JVAE", "scDeconv", "stDeconv"]
+__all__ = ["VAE", "LDVAE", "TOTALVAE", "AutoZIVAE", "SCANVAE", "Classifier", "JVAE", "scDeconv", "stDeconv", "VAEC", "stDeconvAmortized"]

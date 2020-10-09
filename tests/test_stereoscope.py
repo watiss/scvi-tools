@@ -13,6 +13,7 @@ dataset = scvi.data.pbmc_dataset(
             run_setup_anndata=True,
         )
 
+
 dataset.obs["indices"] = np.arange(dataset.n_obs)
 register_tensor_from_anndata(dataset, "ind_x", "obs", "indices")
 
@@ -21,6 +22,7 @@ model.train(n_epochs=100, frequency=1)
 params = model.get_params()
 
 
-model = stStereoscope(dataset, params)
+model = stStereoscope(dataset, params, amortized=True)
 model.train(n_epochs=100, frequency=1)
 print(model.get_proportions())
+print(model.get_proportions().shape)
