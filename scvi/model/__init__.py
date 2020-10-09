@@ -5,4 +5,4 @@ from .autozi import AUTOZI
 from .scanvi import SCANVI
 from .gimvi import GIMVI
 
-__all__ = ["SCVI", "TOTALVI", "LinearSCVI", "AUTOZI", "SCANVI", "GIMVI", "CondSCVI"]
+__all__ = ["SCVI", "TOTALVI", "LinearSCVI", "AUTOZI", "SCANVI", "GIMVI", "CondSCVI", "stVI"]

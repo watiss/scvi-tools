@@ -3,7 +3,7 @@ import logging
 from anndata import AnnData
 import numpy as np
 from scvi._compat import Literal
-from scvi.core.modules import scDeconv, stDeconv, stDeconvAmortized
+from scvi.core.modules import scDeconv, stDeconv, stDeconvAmortized, stVAE
 from scvi.core.models import BaseModelClass
 from scvi.core.trainers import CustomStereoscopeTrainer
 from scvi.core.data_loaders import CustomStereoscopeDataLoader, ScviDataLoader
@@ -258,7 +258,7 @@ class stStereoscope(BaseModelClass):
 
 class stVI(BaseModelClass):
     """
-    Model for continuous deconvolution    
+    Model for continuous deconvolution.    
 
     Parameters
     ----------
@@ -288,15 +288,18 @@ class stVI(BaseModelClass):
     def __init__(
         self,
         st_adata: AnnData,
+        n_labels: int,
         state_dict: List[OrderedDict],
         gene_likelihood: Literal["nb", "poisson"] = "nb",
         use_cuda: bool = True,
         **model_kwargs,
     ):
-        super(stSterestVI, self).__init__(st_adata, use_cuda=use_cuda)
+        super(stVI, self).__init__(st_adata, use_cuda=use_cuda)
 
         # first we have the scRNA-seq model
         self.model = stVAE(
+            n_labels=n_labels,
+            n_genes=st_adata.n_vars,
             state_dict=state_dict,
             use_cuda=True,
             **model_kwargs,
@@ -336,12 +339,17 @@ class stVI(BaseModelClass):
 
         adata = self._validate_anndata(adata)
         scdl = self._make_scvi_dl(adata=adata, batch_size=batch_size)
-        latent = []
+        prop = []
+        gamma = []
         for tensors in scdl:
             x = tensors[_CONSTANTS.X_KEY]
-            z = self.model.get_proportions(x)
-            latent += [z.cpu()]
-        return np.array(torch.cat(latent))
+
+            v = self.model.get_proportions(x)
+            g = self.model.get_gamma(x)
+
+            prop += [v.cpu()]
+            gamma += [g.cpu()]
+        return np.array(torch.cat(prop)), np.array(torch.cat(gamma))
 
     def train(self,
         n_epochs: Optional[int] = None,

@@ -534,7 +534,12 @@ class stVAE(nn.Module):
         )
 
         self.decoder.load_state_dict(state_dict[0])
+        for param in self.decoder.parameters():
+            param.requires_grad = False
         self.px_decoder.load_state_dict(state_dict[1])
+        for param in self.px_decoder.parameters():
+            param.requires_grad = False
+        self.px_o = torch.tensor(state_dict[2])
 
         # create encoders (for gammas as well as proportions)
         self.encoder = FCLayers(
@@ -580,6 +585,19 @@ class stVAE(nn.Module):
         res = res / res.sum(axis = 1).reshape(-1,1)
         return res
 
+    def get_gamma(self, x) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        # get estimated unadjusted proportions
+        h = self.encoder(x)
+        return self.gamma_encoder(h)
+
     def get_reconstruction_loss(
         self, x, px_rate, px_o, **kwargs
     ) -> torch.Tensor:
@@ -596,32 +614,31 @@ class stVAE(nn.Module):
     ) -> Dict[str, torch.Tensor]:
         """Helper function used in forward pass."""
         # x_sg \sim NB(softplus(\beta_g) * \sum_{z=1}^Z softplus(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
-
+        M = x.shape[0]
         beta = torch.nn.functional.softplus(self.beta) # n_genes
         h = self.encoder(x)
+
+        # first get the cell type proportion
         v = self.z_encoder(h)
         v = torch.nn.functional.softplus(v) # minibatch_size, n_labels + 1
 
+        # second get the gamma values,  and the gene expression for all cell types
         gamma = self.gamma_encoder(h) # minibatch_size, n_labels * n_latent
-        gamma = gamma.reshape((-1, self.n_latent))
+        gamma = gamma.reshape((-1, self.n_latent)) # minibatch_size * n_labels, n_latent
+        enum_label = torch.arange(0, self.n_labels).repeat((M)).view((-1, 1)) # minibatch_size * n_labels, 1
+        h = self.decoder(gamma.cuda(), torch.ones(M * self.n_latent).view((-1, 1)).cuda(), enum_label.cuda())
+        px_rate = self.px_decoder(h).reshape((M, self.n_labels, -1)) # (minibatch, n_labels, n_genes) 
 
-        enum_label = torch.arange(0, self.n_labels)
-        # repeat, then feed into the encoders
-        # hopefully, get something of shape (minibatch, n_labels, n_genes) and sum product against the proportions
-        w = torch.nn.functional.softplus(self.W)  # n_genes, n_labels
-        eps = torch.nn.functional.softplus(self.eta) # n_genes
-
-        if self.use_cuda:
-            w = w.cuda()
-            px_o = self.px_o.cuda()
-            eps = eps.cuda()
-            v = v.cuda()
-            beta = beta.cuda()
-
+        # add the dummy cell type
+        eps = torch.nn.functional.softplus(self.eta).cuda() # n_genes <- this is the dummy cell type
+        eps = eps.repeat((M, 1)).view(M, 1, -1) # (M, 1, n_genes)
+        
         # account for gene specific bias and add noise
-        r_hat = torch.cat([beta.unsqueeze(1) * w, eps.unsqueeze(1)], dim=1) # n_genes, n_labels + 1
-        # subsample observations
-        px_rate = torch.matmul(v, torch.transpose(r_hat, 0, 1)) # batch_size, n_genes 
+        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate, eps], dim=1) # M, n_labels + 1, n_genes
+        # now combine them for convolution
+        px_rate = torch.sum(v.unsqueeze(2) * r_hat, dim=1) # batch_size, n_genes 
+
+        px_o = self.px_o.cuda()
 
         return dict(
             px_o=px_o,
