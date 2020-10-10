@@ -551,8 +551,8 @@ class stVAE(nn.Module):
             dropout_rate=0.1,
         )
         self.z_encoder = nn.Linear(n_hidden, n_labels + 1)
-        self.gamma_encoder = nn.Linear(n_hidden, n_latent * n_labels)
- 
+        self.gamma_encoder = nn.Sequential(nn.Linear(n_hidden, n_latent * n_labels), nn.Tanh())
+        self.transform_gamma = lambda x: 2 * x
         #####
         #
         # x_sg \sim NB(\beta_g * \sum_{z=1}^Z exp(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
@@ -596,7 +596,7 @@ class stVAE(nn.Module):
         """
         # get estimated unadjusted proportions
         h = self.encoder(x)
-        return self.gamma_encoder(h)
+        return self.transform_gamma(self.gamma_encoder(h))
 
     def get_reconstruction_loss(
         self, x, px_rate, px_o, **kwargs
@@ -623,7 +623,7 @@ class stVAE(nn.Module):
         v = torch.nn.functional.softplus(v) # minibatch_size, n_labels + 1
 
         # second get the gamma values,  and the gene expression for all cell types
-        gamma = self.gamma_encoder(h) # minibatch_size, n_labels * n_latent
+        gamma = self.transform_gamma(self.gamma_encoder(h)) # minibatch_size, n_labels * n_latent
         gamma = gamma.reshape((-1, self.n_latent)) # minibatch_size * n_labels, n_latent
         enum_label = torch.arange(0, self.n_labels).repeat((M)).view((-1, 1)) # minibatch_size * n_labels, 1
         h = self.decoder(gamma.cuda(), torch.ones(M * self.n_latent).view((-1, 1)).cuda(), enum_label.cuda())
