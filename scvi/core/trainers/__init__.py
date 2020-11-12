@@ -1,4 +1,4 @@
-from .inference import UnsupervisedTrainer, CustomStereoscopeTrainer
+from .inference import UnsupervisedTrainer, CustomStereoscopeTrainer, SparseTrainer
 from .total_inference import TotalTrainer
 from .annotation import SemiSupervisedTrainer, ClassifierTrainer
 from .jvae_trainer import JVAETrainer
@@ -9,5 +9,6 @@ __all__ = [
     "SemiSupervisedTrainer",
     "JVAETrainer",
     "ClassifierTrainer",
-    "CustomStereoscopeTrainer"
+    "CustomStereoscopeTrainer",
+    "SparseTrainer"
 ]

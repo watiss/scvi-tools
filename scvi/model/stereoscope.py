@@ -290,6 +290,7 @@ class stVI(BaseModelClass):
         st_adata: AnnData,
         n_labels: int,
         state_dict: List[OrderedDict],
+        cell_type_prior: np.ndarray,
         gene_likelihood: Literal["nb", "poisson"] = "nb",
         use_cuda: bool = True,
         **model_kwargs,
@@ -301,6 +302,7 @@ class stVI(BaseModelClass):
             n_labels=n_labels,
             n_genes=st_adata.n_vars,
             state_dict=state_dict,
+            cell_type_prior=cell_type_prior,
             use_cuda=True,
             **model_kwargs,
         )
@@ -343,7 +345,6 @@ class stVI(BaseModelClass):
         gamma = []
         for tensors in scdl:
             x = tensors[_CONSTANTS.X_KEY]
-
             v = self.model.get_proportions(x)
             g = self.model.get_gamma(x)
 

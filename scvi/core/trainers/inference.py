@@ -5,6 +5,7 @@ import anndata
 
 from numpy import ceil
 from typing import Union
+import constopt
 
 from scvi import _CONSTANTS
 from .trainer import Trainer
@@ -193,6 +194,26 @@ class UnsupervisedTrainer(Trainer):
             % (int(self.training_time), self.n_epochs)
         )
 
+class SparseTrainer(UnsupervisedTrainer):
+    def __init__(self, model, adata, frequency=5, **kwargs):
+        super().__init__(model, adata, frequency=frequency, **kwargs)
+        
+    def training_extras_init(self, **extras_kwargs):
+        """Other necessary models to simultaneously train."""
+        # unpack constraint
+        alpha = extras_kwargs.get("alpha")
+        constraint = constopt.constraints.L1Ball(alpha)
+        self.optimizer_sparse = constopt.stochastic.PGD(self.model.nu, constraint)
+        # create optimizer
+
+
+    def on_training_loop(self, tensors_dict):
+        self.current_loss = loss = self.loss(*tensors_dict)
+        self.optimizer.zero_grad()
+        self.optimizer_sparse.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        self.optimizer_sparse.step()
 
 class AdapterTrainer(UnsupervisedTrainer):
     def __init__(self, model, adata, test_data_loader, frequency=5):

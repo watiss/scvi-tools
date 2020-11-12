@@ -7,6 +7,9 @@ import torch.nn as nn
 # import torch.nn.functional as F
 from torch.distributions import Normal
 
+from torch.distributions import Normal, Categorical, kl_divergence as kl
+
+
 from scvi.core._distributions import (
     NegativeBinomial, Poisson
 )
@@ -504,10 +507,10 @@ class stVAE(nn.Module):
         n_labels: int,
         state_dict: List[OrderedDict],
         n_genes:int,
+        cell_type_prior: np.ndarray,
         n_latent: int=2,
         n_hidden: int=128,
         n_layers: int=1,
-        n_batch: int=1,
         gene_likelihood: str = "nb",
         use_cuda=True
     ):
@@ -516,14 +519,18 @@ class stVAE(nn.Module):
         self.gene_likelihood = gene_likelihood
         self.n_genes = n_genes
         self.n_latent = n_latent
-        self.n_batch = n_batch
         self.n_labels = n_labels
-
+        self.cell_type_prior = torch.nn.Parameter(
+            cell_type_prior
+            if cell_type_prior is not None
+            else (1 / (n_labels+1)) * torch.ones(1, n_labels+1),
+            requires_grad=False,
+        )
         # import parameters from sc model
         self.decoder = FCLayers(
             n_in=n_latent,
             n_out=n_hidden,
-            n_cat_list=[n_batch, n_labels],
+            n_cat_list=[n_labels],
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=0.1,
@@ -541,8 +548,8 @@ class stVAE(nn.Module):
             param.requires_grad = False
         self.px_o = torch.tensor(state_dict[2])
 
-        # create encoders (for gammas as well as proportions)
-        self.encoder = FCLayers(
+        # create encoders (for proportions)
+        self.encoder= FCLayers(
             n_in=n_genes,
             n_out=n_hidden,
             n_cat_list=[],
@@ -551,6 +558,8 @@ class stVAE(nn.Module):
             dropout_rate=0.1,
         )
         self.z_encoder = nn.Linear(n_hidden, n_labels + 1)
+
+        # create separate encoder for gammas (avoid parameter sharing)?
         self.gamma_encoder = nn.Sequential(nn.Linear(n_hidden, n_latent * n_labels), nn.Tanh())
         self.transform_gamma = lambda x: 2 * x
         #####
@@ -624,9 +633,9 @@ class stVAE(nn.Module):
 
         # second get the gamma values,  and the gene expression for all cell types
         gamma = self.transform_gamma(self.gamma_encoder(h)) # minibatch_size, n_labels * n_latent
-        gamma = gamma.reshape((-1, self.n_latent)) # minibatch_size * n_labels, n_latent
+        gamma_reshape = gamma.reshape((-1, self.n_latent)) # minibatch_size * n_labels, n_latent
         enum_label = torch.arange(0, self.n_labels).repeat((M)).view((-1, 1)) # minibatch_size * n_labels, 1
-        h = self.decoder(gamma.cuda(), torch.ones(M * self.n_latent).view((-1, 1)).cuda(), enum_label.cuda())
+        h = self.decoder(gamma_reshape, enum_label.cuda())
         px_rate = self.px_decoder(h).reshape((M, self.n_labels, -1)) # (minibatch, n_labels, n_genes) 
 
         # add the dummy cell type
@@ -643,7 +652,9 @@ class stVAE(nn.Module):
         return dict(
             px_o=px_o,
             px_rate=px_rate,
-            eta=self.eta
+            eta=self.eta,
+            gamma=gamma,
+            v = v,
         )
 
     def forward(
@@ -671,14 +682,30 @@ class stVAE(nn.Module):
         px_rate = outputs["px_rate"]
         px_o = outputs["px_o"]
         eta = outputs["eta"]
+        gamma = outputs["gamma"]
+        v = outputs["v"]
 
+        # reconstruction loss
         reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
 
-        # prior likelihood
+        # global prior likelihood
         mean = torch.zeros_like(eta)
         scale = torch.ones_like(eta)
 
-        neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()
-         
-        return reconst_loss, 0.0, neg_log_likelihood_prior
+        glo_neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()        
+
+       # gamma
+        mean = torch.zeros_like(gamma)
+        scale = 0.1 * torch.ones_like(gamma)
+
+        neg_log_likelihood_prior = -Normal(mean, scale).log_prob(gamma).sum(1)
+
+        # proportions
+        # probs = v / v.sum(dim=1, keep_dims=True)
+        # local_kl = kl(
+        #     Categorical(probs=probs),
+        #     Categorical(probs=self.y_prior.repeat(probs.size(0), 1)),
+        # )
+        local_kl = 0.0
+        return reconst_loss + neg_log_likelihood_prior + local_kl, 0.0, glo_neg_log_likelihood_prior
 

@@ -7,13 +7,13 @@ import torch
 from scvi._constants import _CONSTANTS
 from scvi._compat import Literal
 from typing import Optional, Sequence
-from scvi.core.modules import VAE, VAEC
+from scvi.core.modules import VAE, VAEC, sVAEC
 from scvi.core.models import (
     BaseModelClass,
     RNASeqMixin,
     VAEMixin,
 )
-from scvi.core.trainers import UnsupervisedTrainer
+from scvi.core.trainers import UnsupervisedTrainer, SparseTrainer
 from scvi.core.data_loaders import ScviDataLoader
 from torch.utils.data import TensorDataset, DataLoader
 
@@ -175,15 +175,19 @@ class CondSCVI(RNASeqMixin, VAEMixin, BaseModelClass):
         n_latent: int = 10,
         n_layers: int = 1,
         dropout_rate: float = 0.1,
+        sparse=True,
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["nb", "poisson"] = "nb",
         use_cuda: bool = True,
         **model_kwargs,
     ):
+        self.sparse = sparse
         super(CondSCVI, self).__init__(adata, use_cuda=use_cuda)
-        self.model = VAEC(
+        class_ = VAEC
+        if self.sparse:
+            class_ = sVAEC
+        self.model = class_(
             n_input=self.summary_stats["n_genes"],
-            n_batch=self.summary_stats["n_batch"],
             n_labels=self.summary_stats["n_labels"],
             n_hidden=n_hidden,
             n_latent=n_latent,
@@ -208,7 +212,10 @@ class CondSCVI(RNASeqMixin, VAEMixin, BaseModelClass):
 
     @property
     def _trainer_class(self):
-        return UnsupervisedTrainer
+        if self.sparse:
+            return SparseTrainer
+        else:
+            return UnsupervisedTrainer
 
     @property
     def _scvi_dl_class(self):
@@ -268,7 +275,6 @@ class CondSCVI(RNASeqMixin, VAEMixin, BaseModelClass):
     def generate_from_latent(
         self,
         z: Optional[np.ndarray] = None,
-        batch_indices: Optional[np.ndarray] = None,
         labels: Optional[np.ndarray] = None,
         give_param: bool = True,
         batch_size: Optional[int] = None,
@@ -282,9 +288,7 @@ class CondSCVI(RNASeqMixin, VAEMixin, BaseModelClass):
             Numpy array with latent space
         labels
             Numpy array with labels
-        batch_indices
-            Numpy array with batch
-        give_mean
+        give_param
             Give parameters of distribution or sample from it.
         batch_size
             Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
@@ -296,10 +300,10 @@ class CondSCVI(RNASeqMixin, VAEMixin, BaseModelClass):
         if self.is_trained_ is False:
             raise RuntimeError("Please train the model first.")
 
-        dl = DataLoader(TensorDataset(torch.Tensor(z), torch.Tensor(batch_indices), torch.Tensor(labels)), batch_size=128) # create your dataloader
+        dl = DataLoader(TensorDataset(torch.tensor(z), torch.tensor(labels, dtype=torch.long)), batch_size=128) # create your dataloader
 
         rate = []
         for tensors in dl:
-            px_rate = self.model.generate_rate(tensors[0].cuda(), tensors[1].cuda(), tensors[2].cuda())
+            px_rate = self.model.generate_rate(tensors[0].cuda(), tensors[1].cuda())
             rate += [px_rate.cpu()]
         return np.array(torch.cat(rate))

@@ -51,7 +51,7 @@ class VAEMixin:
         """
         train_fun_kwargs = dict(train_fun_kwargs)
         if self.is_trained_ is False:
-            self.trainer = UnsupervisedTrainer(
+            self.trainer = self._trainer_class(
                 self.model,
                 self.adata,
                 train_size=train_size,
