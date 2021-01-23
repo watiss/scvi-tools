@@ -71,10 +71,10 @@ class VAEC(VAE):
         n_latent=10,
         n_layers=1,
         dropout_rate=0.1,
-        y_prior=None,
         dispersion="gene",
         log_variational=True,
         gene_likelihood="nb",
+        **model_kwargs,
     ):
         super().__init__(
             n_input,
@@ -105,15 +105,23 @@ class VAEC(VAE):
             n_layers=n_layers,
             n_hidden=n_hidden,
             dropout_rate=0,
+            use_layer_norm=True,
+            use_batch_norm=False,
         )
         self.px_decoder = nn.Sequential(
         nn.Linear(n_hidden, n_input),
         nn.Softplus()
         )
 
+        self.ct_prop = torch.tensor(model_kwargs["ct_prop"], dtype=torch.float32).cuda()
+
     def generate_rate(self, z, batch_index=None, y=None):
         h = self.decoder(z, batch_index, y)
         return self.px_decoder(h)
+
+    def get_vamp_prior(self, x, y=None):
+        out = self.inference(x, y)
+        return [out["qz_m"], out["qz_v"]]
 
     def inference(
         self, x, y=None, n_samples=1
@@ -159,6 +167,11 @@ class VAEC(VAE):
         kl_divergence_z = kl(Normal(qz_m, torch.sqrt(qz_v)), Normal(mean, scale)).sum(
             dim=1
         )
+
+        # cell_type proportion
+        scaling_factor = self.ct_prop[y[:, 0]]
+        reconst_loss = reconst_loss * scaling_factor
+        kl_divergence_z = kl_divergence_z * scaling_factor
         
         return reconst_loss, kl_divergence_z, 0.0
 
@@ -257,13 +270,16 @@ class sVAEC(VAE):
         self.mu = torch.nn.Parameter(torch.randn(n_input, n_labels)) # n_genes, n_cell types
 
         # this is the variable we wish to perform constrained optim over: init to zero for sparsity
-        self.nu = torch.zeros(n_latent, n_input, n_labels).requires_grad_(True).cuda() # n_latent, n_genes, n_cell types
-        
+        # I also put it 2d to avoid issues with the PGD
+        # self.nu = torch.randn(n_latent, n_input, n_labels).requires_grad_(True) # n_latent * n_genes, n_cell types
+        self.nu = torch.nn.Parameter(torch.randn(n_latent, n_input, n_labels)) # n_latent * n_genes, n_cell types
+        # self.z_transformation = nn.Softmax(dim=-1)
+
         # VI parameters
         self.z_encoder = Encoder(
             n_input,
             n_latent,
-            n_cat_list=[n_labels],
+            # n_cat_list=[n_labels],
             n_hidden=n_hidden,
             n_layers=n_layers,
             dropout_rate=dropout_rate,
@@ -279,6 +295,7 @@ class sVAEC(VAE):
         px_scale = ct_profile * torch.nn.functional.softplus(wct_profile)
         return px_scale
 
+
     def inference(
         self, x, y=None, n_samples=1
     ) -> Dict[str, torch.Tensor]:
@@ -288,16 +305,20 @@ class sVAEC(VAE):
             x_ = torch.log(1 + x_)
 
         # Sampling
-        qz_m, qz_v, z = self.z_encoder(x_, y) # cells by latent
-
+        # qz_m, qz_v, z = self.z_encoder(x_, y) # cells by latent
+        qz_m, qz_v, z = self.z_encoder(x_)
+        # z = self.z_transformation(z)
         # generative model
         ct_profile = self.mu[:, y[:, 0]].T # cells per gene
+        # nu = self.nu.cuda()
+        # nu = torch.reshape(nu, (-1, self.mu.shape[0], self.mu.shape[1]))
         cov_profile = torch.transpose(torch.transpose(self.nu[:, :, y[:, 0]], 0, 2), 1, 2) # cells, n_latent, genes 
         wct_profile = torch.sum(z[:, :, None] * cov_profile, axis=1) # cells per gene
 
         # getting library
         library = torch.sum(x, dim=1, keepdim=True)
         px_scale = torch.nn.functional.softplus(ct_profile + wct_profile)
+        # px_scale = torch.exp(wct_profile)
         px_rate = library * px_scale
 
         return dict(
@@ -330,9 +351,8 @@ class sVAEC(VAE):
         # print(torch.mean(qz_v))
         # prior for nu
         mean = torch.zeros_like(self.nu)
-        scale = 0.00001 * torch.ones_like(self.nu)
+        scale = torch.ones_like(self.nu)
 
-        neg_log_likelihood_prior = -Normal(mean, scale).log_prob(self.nu).sum()
-        
-        return reconst_loss + kl_divergence_z, 0. , neg_log_likelihood_prior
-
+        # neg_log_likelihood_prior = -Normal(mean, scale).log_prob(self.nu).sum()
+        # return reconst_loss + kl_divergence_z, 0. , neg_log_likelihood_prior
+        return reconst_loss, kl_divergence_z, 0.

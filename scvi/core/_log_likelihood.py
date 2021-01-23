@@ -292,6 +292,7 @@ def log_nb_positive_altparam(x, r, o, eps=1e-8):
     """
     Log likelihood (scalar) of a minibatch according to a nb model.
 
+    Note: for this specific parameterization, E[x] = r * exp(o)
     Note: All inputs should be torch Tensors
     Variables:
     r: positive parameter of the negative binomial (has to be positive support) (shape: minibatch x genes)

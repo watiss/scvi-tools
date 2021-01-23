@@ -3,7 +3,7 @@ import logging
 from anndata import AnnData
 import numpy as np
 from scvi._compat import Literal
-from scvi.core.modules import scDeconv, stDeconv, stDeconvAmortized, stVAE
+from scvi.core.modules import scDeconv, stDeconv, stDeconvAmortized, stVAE, hstDeconv, hstDeconvSemiAmortized
 from scvi.core.models import BaseModelClass
 from scvi.core.trainers import CustomStereoscopeTrainer
 from scvi.core.data_loaders import CustomStereoscopeDataLoader, ScviDataLoader
@@ -11,6 +11,8 @@ from typing import Optional, List
 from collections import OrderedDict
 
 import torch
+from torch.utils.data import TensorDataset, DataLoader
+
 from scvi._constants import _CONSTANTS
 
 logger = logging.getLogger(__name__)
@@ -154,7 +156,7 @@ class stStereoscope(BaseModelClass):
         use_cuda: bool = True,
         **model_kwargs,
     ):
-        super(stStereoscope, self).__init__(st_adata, use_cuda=use_cuda)
+        super().__init__(st_adata, use_cuda=use_cuda)
 
         self.amortized = amortized
         # first we have the scRNA-seq model
@@ -212,6 +214,36 @@ class stStereoscope(BaseModelClass):
             z = self.model.get_proportions(x)
             latent += [z.cpu()]
         return np.array(torch.cat(latent))
+
+    @torch.no_grad()
+    def get_scale_for_ct(
+        self,
+        x: Optional[np.ndarray] = None,
+        ind_x: Optional[np.ndarray] = None,
+        y: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        r"""
+        Return the scaled parameter of the NB for every cell in queried cell types
+
+        Parameters
+        ----------
+
+        Returns
+        -------
+        gene_expression
+        """
+        if self.is_trained_ is False:
+            raise RuntimeError("Please train the model first.")
+
+        dl = DataLoader(TensorDataset(torch.tensor(x, dtype=torch.float32), 
+                    torch.tensor(ind_x, dtype=torch.long), 
+                    torch.tensor(y, dtype=torch.long)), batch_size=128) # create your dataloader
+
+        rate = []
+        for tensors in dl:
+            px_rate = self.model.get_ct_specific_expression(tensors[0].cuda(), tensors[1].cuda(), tensors[2].cuda())
+            rate += [px_rate.cpu()]
+        return np.array(torch.cat(rate))
 
     def train(self,
         n_epochs: Optional[int] = None,
@@ -293,12 +325,14 @@ class stVI(BaseModelClass):
         cell_type_prior: np.ndarray,
         gene_likelihood: Literal["nb", "poisson"] = "nb",
         use_cuda: bool = True,
+        amortized=False,
+        n_spots = None,
         **model_kwargs,
     ):
-        super(stVI, self).__init__(st_adata, use_cuda=use_cuda)
-
-        # first we have the scRNA-seq model
-        self.model = stVAE(
+        super().__init__(st_adata, use_cuda=use_cuda)
+        if amortized:
+            self.model = hstDeconvSemiAmortized(
+            n_spots=n_spots,
             n_labels=n_labels,
             n_genes=st_adata.n_vars,
             state_dict=state_dict,
@@ -306,11 +340,23 @@ class stVI(BaseModelClass):
             use_cuda=True,
             **model_kwargs,
         )
+        else:
+            self.model = hstDeconv(
+            n_spots=n_spots,
+            n_labels=n_labels,
+            n_genes=st_adata.n_vars,
+            state_dict=state_dict,
+            cell_type_prior=cell_type_prior,
+            use_cuda=True,
+            **model_kwargs,
+        )
+        self.amortized = amortized
         self._model_summary_string = (
             "stVI Model with params: \ngene_likelihood: {}"
         ).format(
             gene_likelihood,
         )
+        self.n_labels = n_labels
         self.init_params_ = self._get_init_params(locals())
 
 
@@ -339,18 +385,49 @@ class stVI(BaseModelClass):
         if self.is_trained_ is False:
             raise RuntimeError("Please train the model first.")
 
-        adata = self._validate_anndata(adata)
-        scdl = self._make_scvi_dl(adata=adata, batch_size=batch_size)
-        prop = []
-        gamma = []
-        for tensors in scdl:
-            x = tensors[_CONSTANTS.X_KEY]
-            v = self.model.get_proportions(x)
-            g = self.model.get_gamma(x)
+        if self.amortized:
+            adata = self._validate_anndata(adata)
+            scdl = self._make_scvi_dl(adata=adata, batch_size=batch_size)
+            gamma = []
+            for tensors in scdl:
+                x = tensors[_CONSTANTS.X_KEY]
+                gamma += [self.model.get_gamma(x).cpu()]
+            gamma = np.array(torch.cat(gamma))
+            gamma = gamma.reshape(gamma.shape[0], self.n_labels, -1)
+            return self.model.get_proportions(), gamma
+        
+        else: 
+            return self.model.get_proportions(), self.model.get_gamma()
 
-            prop += [v.cpu()]
-            gamma += [g.cpu()]
-        return np.array(torch.cat(prop)), np.array(torch.cat(gamma))
+    @torch.no_grad()
+    def get_scale_for_ct(
+        self,
+        x: Optional[np.ndarray] = None,
+        ind_x: Optional[np.ndarray] = None,
+        y: Optional[np.ndarray] = None,
+    ) -> np.ndarray:
+        r"""
+        Return the scaled parameter of the NB for every cell in queried cell types
+
+        Parameters
+        ----------
+
+        Returns
+        -------
+        gene_expression
+        """
+        if self.is_trained_ is False:
+            raise RuntimeError("Please train the model first.")
+
+        dl = DataLoader(TensorDataset(torch.tensor(x, dtype=torch.float32), 
+                    torch.tensor(ind_x, dtype=torch.long), 
+                    torch.tensor(y, dtype=torch.long)), batch_size=128) # create your dataloader
+
+        rate = []
+        for tensors in dl:
+            px_rate = self.model.get_ct_specific_expression(tensors[0].cuda(), tensors[1].cuda(), tensors[2].cuda())
+            rate += [px_rate.cpu()]
+        return np.array(torch.cat(rate))
 
     def train(self,
         n_epochs: Optional[int] = None,

@@ -256,7 +256,7 @@ class stDeconv(nn.Module):
             res = res[:,:-1]
         # normalize to obtain adjusted proportions
         res = res / res.sum(axis = 1).reshape(-1,1)
-        return res
+        return res      
 
     def get_reconstruction_loss(
         self, x, px_rate, px_o, **kwargs
@@ -269,6 +269,17 @@ class stDeconv(nn.Module):
             reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
         return reconst_loss
 
+    def get_ct_specific_expression(self, x, ind_x, y):
+        """
+        Returns cell type specific gene expression at the queried spots.
+        """
+        # cell-type specific gene expression. Conceptually of shape (minibatch, celltype, gene). 
+        # But in this case, it's the same for all spots with the same cell type
+        beta = torch.nn.functional.softplus(self.beta).cuda() # n_genes
+        w = torch.nn.functional.softplus(self.W).cuda() # n_genes, n_spots
+        px_ct = torch.exp(self.px_o.cuda()).unsqueeze(1) * beta.unsqueeze(1) * w 
+        return px_ct[:, y[:, 0]].T # shape (minibatch, genes)
+
     def inference(
         self, x, ind_x,
     ) -> Dict[str, torch.Tensor]:
@@ -280,6 +291,7 @@ class stDeconv(nn.Module):
         w = torch.nn.functional.softplus(self.W)  # n_genes, n_labels
         eps = torch.nn.functional.softplus(self.eta) # n_genes
 
+        # library = torch.sum(x, dim=1, keepdim=True)
         if self.use_cuda:
             w = w.cuda()
             px_o = self.px_o.cuda()
@@ -291,12 +303,14 @@ class stDeconv(nn.Module):
         r_hat = torch.cat([beta.unsqueeze(1) * w, eps.unsqueeze(1)], dim=1) # n_genes, n_labels + 1
         # subsample observations
         v_ind = v[:, ind_x[:, 0]] # labels + 1, batch_size
-        px_rate = torch.transpose(torch.matmul(r_hat, v_ind), 0, 1) # batch_size, n_genes 
-
+        px_scale = torch.transpose(torch.matmul(r_hat, v_ind), 0, 1) # batch_size, n_genes 
+        # px_rate = library * px_scale
+        px_rate = px_scale
         return dict(
             px_o=px_o,
             px_rate=px_rate,
-            eta=self.eta
+            px_scale=px_scale,
+            eta=self.eta,
         )
 
     def forward(
@@ -334,6 +348,537 @@ class stDeconv(nn.Module):
         neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()
          
         return reconst_loss, 0.0, neg_log_likelihood_prior
+
+
+class hstDeconv(nn.Module):
+    """
+    NON AMORTIZED VERSION of non-linear model for cell-type deconvolution of spatial transcriptomics data.
+
+    Parameters
+    ----------
+    state_dict 
+        state_dict of the decoder of the CondScVI
+    gene_likelihood
+        One of
+
+        * ``'nb'`` - Negative binomial distribution
+        * ``'poisson'`` - Poisson distribution
+    """
+
+    def __init__(
+        self,
+        n_spots:int,
+        n_labels: int,
+        state_dict: List[OrderedDict],
+        n_genes:int,
+        cell_type_prior: np.ndarray,
+        n_latent: int=2,
+        n_hidden: int=128,
+        n_layers: int=1,
+        gene_likelihood: str = "nb",
+        use_cuda=True,
+        gamma=None,
+        mean_vprior=None,
+        var_vprior=None
+    ):
+        super().__init__()
+        self.use_cuda = use_cuda
+        self.gene_likelihood = gene_likelihood
+        self.n_spots = n_spots
+        self.n_genes = n_genes
+        self.n_latent = n_latent
+        self.n_labels = n_labels
+        self.cell_type_prior = torch.nn.Parameter(
+            cell_type_prior
+            if cell_type_prior is not None
+            else (1 / (n_labels+1)) * torch.ones(1, n_labels+1),
+            requires_grad=False,
+        )
+        # import parameters from sc model
+        self.decoder = FCLayers(
+            n_in=n_latent,
+            n_out=n_hidden,
+            n_cat_list=[n_labels],
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=0,
+            use_layer_norm=True,
+            use_batch_norm=False,
+        )
+        self.px_decoder = nn.Sequential(
+        nn.Linear(n_hidden, n_genes),
+        nn.Softplus()
+        )
+        # don't compute gradient for those parameters
+        self.decoder.load_state_dict(state_dict[0])
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        self.px_decoder.load_state_dict(state_dict[1])
+        for param in self.px_decoder.parameters():
+            param.requires_grad = False
+        self.px_o = torch.tensor(state_dict[2])
+
+
+        # cell_type specific factor loadings 
+        self.V = torch.nn.Parameter(torch.randn(self.n_labels + 1, self.n_spots))
+
+        # within cell_type factor loadings
+        if gamma is None:
+            self.gamma = torch.nn.Parameter(torch.randn(n_latent, self.n_labels, self.n_spots))
+        else:
+            print("USING FIXED GAMMA")
+            self.gamma = torch.tensor(gamma)
+
+        if mean_vprior is not None:
+            print("USING VAMP PRIOR")
+            self.p = mean_vprior.shape[1]
+            self.mean_vprior = torch.tensor(mean_vprior).cuda() # shape (n_labels, n_points, n_latent)
+            self.var_vprior = torch.tensor(var_vprior).cuda()
+        else:
+            self.mean_vprior = None
+            self.var_vprior = None
+        # noise from data
+        self.eta = torch.nn.Parameter(torch.randn(self.n_genes))
+        # additive gene bias
+        self.beta = torch.nn.Parameter(0.1 * torch.randn(self.n_genes))
+        # self.beta = torch.ones((self.n_genes))
+
+    def get_proportions(self, keep_noise=False) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        # get estimated unadjusted proportions
+        res = torch.nn.functional.softplus(self.V).detach().cpu().numpy().T # n_spots, n_labels + 1
+        # remove dummy cell type proportion values
+        if not keep_noise:
+            res = res[:,:-1]
+        # normalize to obtain adjusted proportions
+        res = res / res.sum(axis = 1).reshape(-1,1)
+        return res
+
+    def get_gamma(self) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        # get estimated unadjusted proportions
+        return self.gamma.detach().cpu().numpy() # (n_latent, n_labels, n_spots)
+
+    def get_reconstruction_loss(
+        self, x, px_rate, px_o, **kwargs
+    ) -> torch.Tensor:
+        if self.gene_likelihood == "nb":
+            reconst_loss = (
+                -log_nb_positive_altparam(x, px_rate, px_o).sum(dim=-1)
+            )
+        elif self.gene_likelihood == "poisson":
+            reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
+        return reconst_loss
+
+    def get_ct_specific_expression(self, x, ind_x, y):
+        """
+        Returns cell type specific gene expression at the queried spots.
+        """
+        # cell-type specific gene expression. Conceptually of shape (minibatch, celltype, gene). 
+        # But in this case, it's the same for all spots with the same cell type
+        beta = torch.nn.functional.softplus(self.beta) # n_genes
+        gamma = self.gamma # n_latent, n_labels, n_spots
+        gamma_ind = gamma[:, :, ind_x[:, 0]] # n_latent, n_labels, minibatch_size
+        gamma_select = gamma_ind[:, y[:, 0], torch.arange(ind_x.shape[0])].T # minibatch_size, n_latent
+        h = self.decoder(gamma_select, y)
+        px_rate = self.px_decoder(h) # (minibatch, n_genes) 
+        px_ct = torch.exp(self.px_o.cuda()).unsqueeze(0) * beta.unsqueeze(0) * px_rate
+        return px_ct # shape (minibatch, genes)
+
+    def inference(
+        self, x, ind_x,
+    ) -> Dict[str, torch.Tensor]:
+        """Helper function used in forward pass."""
+        # x_sg \sim NB(softplus(\beta_g) * \sum_{z=1}^Z softplus(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
+        M = x.shape[0]
+
+        library = torch.sum(x, dim=1, keepdim=True)
+        # setup all nonlinarities
+        beta = torch.nn.functional.softplus(self.beta) # n_genes
+        v = torch.nn.functional.softplus(self.V) # n_labels + 1, n_spots
+        eps = torch.nn.functional.softplus(self.eta) # n_genes
+
+        # port on CUDA
+        if self.use_cuda:
+            px_o = self.px_o.cuda()
+            eps = eps.cuda()
+            v = v.cuda()
+            beta = beta.cuda()
+            gamma = self.gamma.cuda()
+
+        # subsample parameters
+        v_ind = v[:, ind_x[:, 0]].T # minibatch_size, labels + 1
+        gamma_ind = gamma[:, :, ind_x[:, 0]] # n_latent, n_labels, minibatch_size
+
+        # reshape and get gene expression value for all minibatch
+        gamma_ind = torch.transpose(gamma_ind, 2, 0) # minibatch_size, n_labels, n_latent
+        gamma_reshape = gamma_ind.reshape((-1, self.n_latent)) # minibatch_size * n_labels, n_latent
+        enum_label = torch.arange(0, self.n_labels).repeat((M)).view((-1, 1)) # minibatch_size * n_labels, 1
+        h = self.decoder(gamma_reshape, enum_label.cuda())
+        px_rate = self.px_decoder(h).reshape((M, self.n_labels, -1)) # (minibatch, n_labels, n_genes) 
+
+        # add the dummy cell type
+        eps = eps.repeat((M, 1)).view(M, 1, -1) # (M, 1, n_genes) <- this is the dummy cell type
+        
+        # account for gene specific bias and add noise
+        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate, eps], dim=1) # M, n_labels + 1, n_genes
+        # now combine them for convolution
+        px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1) # batch_size, n_genes 
+        px_rate = library * px_scale
+        
+
+        return dict(
+            px_o=px_o,
+            px_rate=px_rate,
+            px_scale=px_scale,
+            eta=self.eta,
+            gamma=gamma_ind, # minibatch_size, n_labels, n_latent
+            # v = v_ind,
+        )
+
+    def forward(
+        self, x, y, ind_x,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns the reconstruction loss and the KL divergences.
+
+        Parameters
+        ----------
+        x
+            tensor of values with shape (batch_size, n_input)
+        y
+            tensor of cell types (ignored)
+        ind_x
+            tensor of indices with shape (batch_size,)
+
+        Returns
+        -------
+        type
+            the reconstruction loss and the Kullback divergences
+        """
+        # Parameters for z latent distribution
+        outputs = self.inference(x, ind_x)
+        px_rate = outputs["px_rate"]
+        px_o = outputs["px_o"]
+        eta = outputs["eta"]
+        gamma = outputs["gamma"]
+        # v = outputs["v"]
+
+        # reconstruction loss
+        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
+
+        # global prior likelihood
+        mean = torch.zeros_like(eta)
+        scale = torch.ones_like(eta)
+
+        glo_neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()        
+
+        # gamma
+        if self.mean_vprior is None:
+           #isotropic normal prior
+            mean = torch.zeros_like(gamma)
+            scale = torch.ones_like(gamma)
+            neg_log_likelihood_prior = -Normal(mean, scale).log_prob(gamma).sum(2).sum(1)
+        else:
+            # vampprior
+            # gamma is of shape n_latent, n_labels, minibatch_size
+            gamma = gamma.unsqueeze(1) # minibatch_size, 1, n_labels, n_latent
+            mean_vprior = torch.transpose(self.mean_vprior, 0, 1).unsqueeze(0) # 1, p, n_labels, n_latent
+            var_vprior = torch.transpose(self.var_vprior, 0, 1).unsqueeze(0) # 1, p, n_labels, n_latent
+            pre_lse = Normal(mean_vprior, torch.sqrt(var_vprior)).log_prob(gamma).sum(-1) # minibatch, p, n_labels
+            log_likelihood_prior = torch.logsumexp(pre_lse, 1) - np.log(self.p) # minibatch, n_labels
+            neg_log_likelihood_prior = -log_likelihood_prior.sum(1) # minibatch
+            # mean_vprior is of shape n_labels, p, n_latent
+
+        # proportions
+        # probs = v / v.sum(dim=1, keep_dims=True)
+        # local_kl = kl(
+        #     Categorical(probs=probs),
+        #     Categorical(probs=self.y_prior.repeat(probs.size(0), 1)),
+        # )
+        return reconst_loss, neg_log_likelihood_prior, glo_neg_log_likelihood_prior
+
+
+class hstDeconvSemiAmortized(nn.Module):
+    """
+    Semi AMORTIZED VERSION of non-linear model for cell-type deconvolution of spatial transcriptomics data.
+
+    Parameters
+    ----------
+    state_dict 
+        state_dict of the decoder of the CondScVI
+    gene_likelihood
+        One of
+
+        * ``'nb'`` - Negative binomial distribution
+        * ``'poisson'`` - Poisson distribution
+    """
+
+    def __init__(
+        self,
+        n_spots:int,
+        n_labels: int,
+        state_dict: List[OrderedDict],
+        n_genes:int,
+        cell_type_prior: np.ndarray,
+        n_latent: int=2,
+        n_hidden: int=128,
+        n_layers: int=1,
+        gene_likelihood: str = "nb",
+        use_cuda=True,
+        gamma=None,
+        mean_vprior=None,
+        var_vprior=None
+    ):
+        super().__init__()
+        self.use_cuda = use_cuda
+        self.gene_likelihood = gene_likelihood
+        self.n_spots = n_spots
+        self.n_genes = n_genes
+        self.n_latent = n_latent
+        self.n_labels = n_labels
+        self.cell_type_prior = torch.nn.Parameter(
+            cell_type_prior
+            if cell_type_prior is not None
+            else (1 / (n_labels+1)) * torch.ones(1, n_labels+1),
+            requires_grad=False,
+        )
+        # import parameters from sc model
+        self.decoder = FCLayers(
+            n_in=n_latent,
+            n_out=n_hidden,
+            n_cat_list=[n_labels],
+            n_layers=n_layers,
+            n_hidden=n_hidden,
+            dropout_rate=0,
+            use_layer_norm=True,
+            use_batch_norm=False,
+        )
+        self.px_decoder = nn.Sequential(
+        nn.Linear(n_hidden, n_genes),
+        nn.Softplus()
+        )
+        # don't compute gradient for those parameters
+        self.decoder.load_state_dict(state_dict[0])
+        for param in self.decoder.parameters():
+            param.requires_grad = False
+        self.px_decoder.load_state_dict(state_dict[1])
+        for param in self.px_decoder.parameters():
+            param.requires_grad = False
+        self.px_o = torch.tensor(state_dict[2])
+
+
+        # cell_type specific factor loadings 
+        self.V = torch.nn.Parameter(torch.randn(self.n_labels + 1, self.n_spots))
+
+        # within cell_type factor loadings
+        self.gamma_encoder= nn.Sequential(
+            FCLayers(
+            n_in=n_genes,
+            n_out=n_hidden,
+            n_cat_list=[],
+            n_layers=2,
+            n_hidden=n_hidden,
+            dropout_rate=0,
+            use_layer_norm=True,
+            use_batch_norm=False,
+                    ),nn.Linear(n_hidden, n_latent * n_labels))
+
+
+        if mean_vprior is not None:
+            print("USING VAMP PRIOR")
+            self.p = mean_vprior.shape[1]
+            self.mean_vprior = torch.tensor(mean_vprior).cuda() # shape (n_labels, n_points, n_latent)
+            self.var_vprior = torch.tensor(var_vprior).cuda()
+        else:
+            self.mean_vprior = None
+            self.var_vprior = None
+        # noise from data
+        self.eta = torch.nn.Parameter(torch.randn(self.n_genes))
+        # additive gene bias
+        self.beta = torch.nn.Parameter(0.1 * torch.randn(self.n_genes))
+        # self.beta = torch.ones((self.n_genes))
+
+    def get_proportions(self, keep_noise=False) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        # get estimated unadjusted proportions
+        res = torch.nn.functional.softplus(self.V).detach().cpu().numpy().T # n_spots, n_labels + 1
+        # remove dummy cell type proportion values
+        if not keep_noise:
+            res = res[:,:-1]
+        # normalize to obtain adjusted proportions
+        res = res / res.sum(axis = 1).reshape(-1,1)
+        return res
+
+    def get_gamma(self, x) -> torch.Tensor:
+        """
+        Returns the loadings.
+
+        Returns
+        -------
+        type
+            tensor
+        """
+        return self.gamma_encoder(x)
+
+    def get_reconstruction_loss(
+        self, x, px_rate, px_o, **kwargs
+    ) -> torch.Tensor:
+        if self.gene_likelihood == "nb":
+            reconst_loss = (
+                -log_nb_positive_altparam(x, px_rate, px_o).sum(dim=-1)
+            )
+        elif self.gene_likelihood == "poisson":
+            reconst_loss = -Poisson(px_rate).log_prob(x).sum(dim=-1)
+        return reconst_loss
+
+    def get_ct_specific_expression(self, x, ind_x, y):
+        """
+        Returns cell type specific gene expression at the queried spots.
+        """
+        # cell-type specific gene expression. Conceptually of shape (minibatch, celltype, gene). 
+        # But in this case, it's the same for all spots with the same cell type
+        beta = torch.nn.functional.softplus(self.beta) # n_genes
+        gamma = self.gamma_encoder(x) # minibatch_size, n_labels * n_latent
+        gamma_ind = gamma.reshape((-1, self.n_labels, self.n_latent)) # minibatch_size, n_labels, n_latent
+        gamma_select = gamma_ind[torch.arange(ind_x.shape[0]), y[:, 0], :] # minibatch_size, n_latent
+        h = self.decoder(gamma_select, y)
+        px_rate = self.px_decoder(h) # (minibatch, n_genes) 
+        px_ct = torch.exp(self.px_o.cuda()).unsqueeze(0) * beta.unsqueeze(0) * px_rate
+        return px_ct # shape (minibatch, genes)
+
+    def inference(
+        self, x, ind_x,
+    ) -> Dict[str, torch.Tensor]:
+        """Helper function used in forward pass."""
+        # x_sg \sim NB(softplus(\beta_g) * \sum_{z=1}^Z softplus(v_sz) * softplus(W)_gz + \gamma_s \eta_g, exp(px_r))
+        M = x.shape[0]
+
+        library = torch.sum(x, dim=1, keepdim=True)
+        # setup all nonlinarities
+        beta = torch.nn.functional.softplus(self.beta) # n_genes
+        v = torch.nn.functional.softplus(self.V) # n_labels + 1, n_spots
+        eps = torch.nn.functional.softplus(self.eta) # n_genes
+
+        # port on CUDA
+        if self.use_cuda:
+            px_o = self.px_o.cuda()
+            eps = eps.cuda()
+            v = v.cuda()
+            beta = beta.cuda()
+
+        # subsample parameters
+        v_ind = v[:, ind_x[:, 0]].T # minibatch_size, labels + 1
+        # second get the gamma values,  and the gene expression for all cell types
+        gamma = self.gamma_encoder(x) # minibatch_size, n_labels * n_latent
+        gamma_ind = gamma.reshape((v_ind.shape[0], self.n_labels, self.n_latent)) # minibatch_size, n_labels, n_latent
+        gamma_reshape = gamma_ind.reshape((-1, self.n_latent)) # minibatch_size * n_labels, n_latent
+
+        enum_label = torch.arange(0, self.n_labels).repeat((M)).view((-1, 1)) # minibatch_size * n_labels, 1
+        h = self.decoder(gamma_reshape, enum_label.cuda())
+        px_rate = self.px_decoder(h).reshape((M, self.n_labels, -1)) # (minibatch, n_labels, n_genes) 
+
+        # add the dummy cell type
+        eps = eps.repeat((M, 1)).view(M, 1, -1) # (M, 1, n_genes) <- this is the dummy cell type
+        
+        # account for gene specific bias and add noise
+        r_hat = torch.cat([beta.unsqueeze(0).unsqueeze(1) * px_rate, eps], dim=1) # M, n_labels + 1, n_genes
+        # now combine them for convolution
+        px_scale = torch.sum(v_ind.unsqueeze(2) * r_hat, dim=1) # batch_size, n_genes 
+        px_rate = library * px_scale
+        
+
+        return dict(
+            px_o=px_o,
+            px_rate=px_rate,
+            px_scale=px_scale,
+            eta=self.eta,
+            gamma=gamma_ind, # minibatch_size, n_labels, n_latent
+            # v = v_ind,
+        )
+
+    def forward(
+        self, x, y, ind_x,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Returns the reconstruction loss and the KL divergences.
+
+        Parameters
+        ----------
+        x
+            tensor of values with shape (batch_size, n_input)
+        y
+            tensor of cell types (ignored)
+        ind_x
+            tensor of indices with shape (batch_size,)
+
+        Returns
+        -------
+        type
+            the reconstruction loss and the Kullback divergences
+        """
+        # Parameters for z latent distribution
+        outputs = self.inference(x, ind_x)
+        px_rate = outputs["px_rate"]
+        px_o = outputs["px_o"]
+        eta = outputs["eta"]
+        gamma = outputs["gamma"]
+        # v = outputs["v"]
+
+        # reconstruction loss
+        reconst_loss = self.get_reconstruction_loss(x, px_rate, px_o)
+
+        # global prior likelihood
+        mean = torch.zeros_like(eta)
+        scale = torch.ones_like(eta)
+
+        glo_neg_log_likelihood_prior = -Normal(mean, scale).log_prob(eta).sum()        
+
+        # gamma
+        if self.mean_vprior is None:
+           #isotropic normal prior
+            mean = torch.zeros_like(gamma)
+            scale = torch.ones_like(gamma)
+            neg_log_likelihood_prior = -Normal(mean, scale).log_prob(gamma).sum(2).sum(1)
+        else:
+            # vampprior
+            # gamma is of shape n_latent, n_labels, minibatch_size
+            gamma = gamma.unsqueeze(1) # minibatch_size, 1, n_labels, n_latent
+            mean_vprior = torch.transpose(self.mean_vprior, 0, 1).unsqueeze(0) # 1, p, n_labels, n_latent
+            var_vprior = torch.transpose(self.var_vprior, 0, 1).unsqueeze(0) # 1, p, n_labels, n_latent
+            pre_lse = Normal(mean_vprior, torch.sqrt(var_vprior)).log_prob(gamma).sum(-1) # minibatch, p, n_labels
+            log_likelihood_prior = torch.logsumexp(pre_lse, 1) - np.log(self.p) # minibatch, n_labels
+            neg_log_likelihood_prior = -log_likelihood_prior.sum(1) # minibatch
+            # mean_vprior is of shape n_labels, p, n_latent
+
+        # proportions
+        # probs = v / v.sum(dim=1, keep_dims=True)
+        # local_kl = kl(
+        #     Categorical(probs=probs),
+        #     Categorical(probs=self.y_prior.repeat(probs.size(0), 1)),
+        # )
+        return reconst_loss, neg_log_likelihood_prior, glo_neg_log_likelihood_prior
 
 class stDeconvAmortized(nn.Module):
     """
@@ -708,4 +1253,3 @@ class stVAE(nn.Module):
         # )
         local_kl = 0.0
         return reconst_loss + neg_log_likelihood_prior + local_kl, 0.0, glo_neg_log_likelihood_prior
-

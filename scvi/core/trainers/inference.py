@@ -5,8 +5,9 @@ import anndata
 
 from numpy import ceil
 from typing import Union
-import constopt
-
+# import constopt
+# import constopt.stochastic
+from torch import optim
 from scvi import _CONSTANTS
 from .trainer import Trainer
 
@@ -195,25 +196,40 @@ class UnsupervisedTrainer(Trainer):
         )
 
 class SparseTrainer(UnsupervisedTrainer):
-    def __init__(self, model, adata, frequency=5, **kwargs):
+    def __init__(self, model, adata, frequency=5, train_size: Union[int, float] = 0.9, test_size: Union[int, float] = None,**kwargs):
         super().__init__(model, adata, frequency=frequency, **kwargs)
+        self.n_samples = 1.0
+
+        self.train_set, self.test_set, self.validation_set = self.train_test_validation(model, adata, train_size, test_size)
+        self.train_set.to_monitor = ["elbo"]
+        self.test_set.to_monitor = ["elbo"]
+        self.validation_set.to_monitor = ["elbo"]
         
     def training_extras_init(self, **extras_kwargs):
         """Other necessary models to simultaneously train."""
         # unpack constraint
-        alpha = extras_kwargs.get("alpha")
-        constraint = constopt.constraints.L1Ball(alpha)
-        self.optimizer_sparse = constopt.stochastic.PGD(self.model.nu, constraint)
+        # self.alpha = extras_kwargs.get("alpha")
+        # constraint = constopt.constraints.L1Ball(self.alpha)
+        # self.optimizer_sparse = constopt.stochastic.MomentumFrankWolfe([self.model.nu], constraint)
         # create optimizer
+        # self.optim_sparse_lr = extras_kwargs.get("sparse_lr")
+        # self.optimizer_sparse = optim.SGD([self.model.nu], lr=self.optim_sparse_lr, momentum=0)
+        
 
 
     def on_training_loop(self, tensors_dict):
         self.current_loss = loss = self.loss(*tensors_dict)
         self.optimizer.zero_grad()
-        self.optimizer_sparse.zero_grad()
+        # self.optimizer_sparse.zero_grad()
         loss.backward()
         self.optimizer.step()
-        self.optimizer_sparse.step()
+        # self.optimizer_sparse.step()
+        # if self.alpha > 0:
+        #     # perform proximal update here
+        #     prox_size = self.alpha * self.optim_sparse_lr
+        #     # now do soft thresholding
+        #     with torch.no_grad():
+        #         self.model.nu = torch.sign(self.model.nu) * torch.clamp(torch.abs(self.model.nu) - prox_size, min=0)
 
 class AdapterTrainer(UnsupervisedTrainer):
     def __init__(self, model, adata, test_data_loader, frequency=5):
