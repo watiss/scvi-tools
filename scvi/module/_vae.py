@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Main module."""
+import warnings
 from typing import Callable, Iterable, Optional
 
 import numpy as np
@@ -23,7 +24,7 @@ class VAE(BaseModuleClass):
     """
     Variational auto-encoder model.
 
-    This is an implementation of the scVI model descibed in [Lopez18]_
+    This is an implementation of the scVI model described in [Lopez18]_
 
     Parameters
     ----------
@@ -288,6 +289,127 @@ class VAE(BaseModuleClass):
         return dict(
             px_scale=px_scale, px_r=px_r, px_rate=px_rate, px_dropout=px_dropout
         )
+
+    def _compute_mmd_kernels(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the kernels for the given tensors, which can be
+        used to compute their MMD. The kernel used here is a
+        Gaussian kernel with :math:`\gamma`=1.
+
+        Parameters
+        ----------
+        z1
+            First tensor
+        z2
+            Second tensor
+
+        Returns
+        -------
+        Tensor containing the kernels of ``z1`` and ``z2``.
+        """
+        z1_size = z1.size(0)
+        z2_size = z2.size(0)
+
+        d = z1.size(1)
+        if d != z2.size(1):
+            raise ValueError(
+                "z1 and z2 must be defined on the same space, "
+                "but input was: z1_d={} while "
+                "z2_d={}.".format(z1.size(1), z2.size(1))
+            )
+
+        z1 = z1.unsqueeze(1)  # (z1_size, 1, d)
+        z2 = z2.unsqueeze(0)  # (1, z2_size, d)
+        z1 = z1.expand(z1_size, z2_size, d)
+        z2 = z2.expand(z1_size, z2_size, d)
+
+        exp_term = (z1 - z2).pow(2).sum(dim=2)  # (z1_size, z2_size)
+        return torch.exp(-exp_term)
+
+    def _compute_mmd(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the Maximum Mean Discrepancy (MMD) of ``z1`` and ``z2``.
+        TODO cite paper
+        Based on https://github.com/napsternxg/pytorch-practice/blob/master/Pytorch%20-%20MMD%20VAE.ipynb
+
+        Parameters
+        ----------
+        z1
+            First tensor
+        z2
+            Second tensor
+
+        Returns
+        -------
+        Tensor with one item containing the MMD of ``z1`` and ``z2``.
+        """
+        k_z1_z1 = self._compute_mmd_kernels(z1, z1)
+        k_z2_z2 = self._compute_mmd_kernels(z2, z2)
+        k_z1_z2 = self._compute_mmd_kernels(z1, z2)
+        mmd = k_z1_z1.mean() + k_z2_z2.mean() - 2 * k_z1_z2.mean()
+        return mmd
+
+    def _compute_fast_mmd(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Computes a fast approximation of the MMD. See `_compute_mmd`.
+
+        Parameters
+        ----------
+        z1
+            First tensor
+        z2
+            Second tensor
+
+        Returns
+        -------
+        Tensor with one item containing an approximation of the MMD of ``z1`` and ``z2``.
+        """
+        z1_size = z1.size(0)
+        z2_size = z2.size(0)
+
+        # z1_size and z2_size must match, otherwise pick their min
+        batch_size = min(z1_size, z2_size)
+        if z1_size != z2_size:
+            warnings.warn(
+                "z1 and z2 don't have matching batch sizes, picking their min: {}.".format(
+                    batch_size
+                )
+            )
+
+        # Drop a sample if batch_size is not even
+        if batch_size % 2 != 0:
+            batch_size -= 1
+
+        z1 = z1[:batch_size, :]
+        z2 = z2[:batch_size, :]
+
+        if z1.size(1) != z2.size(1):
+            raise ValueError(
+                "z1 and z2 must be defined on the same space, "
+                "but input was: z1_d={} while "
+                "z2_d={}.".format(z1.size(1), z2.size(1))
+            )
+
+        # zi_even contains every other sample in zi starting at 0
+        z1_even = z1[: batch_size - 1 : 2, :]
+        z1_odd = z1[1:batch_size:2, :]
+        z2_even = z2[: batch_size - 1 : 2, :]
+        z2_odd = z2[1:batch_size:2, :]
+
+        # Compute the kernels
+        z1_even_odd_kernels = torch.exp(-((z1_even - z1_odd).pow(2).sum(1)))
+        z2_even_odd_kernels = torch.exp(-((z2_even - z2_odd).pow(2).sum(1)))
+        z1_even_z2_odd_kernels = torch.exp(-((z1_even - z2_odd).pow(2).sum(1)))
+        z1_odd_z2_even_kernels = torch.exp(-((z1_odd - z2_even).pow(2).sum(1)))
+
+        all_kernels = (
+            z1_even_odd_kernels
+            + z2_even_odd_kernels
+            - z1_even_z2_odd_kernels
+            - z1_odd_z2_even_kernels
+        )
+        mmd = all_kernels.mean()
+        return mmd
 
     def loss(
         self,
