@@ -102,6 +102,7 @@ class VAE(BaseModuleClass):
         use_observed_lib_size: bool = True,
         var_activation: Optional[Callable] = None,
         mmd_mode: Literal["normal", "fast"] = "normal",
+        mmd_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -115,6 +116,7 @@ class VAE(BaseModuleClass):
         self.encode_covariates = encode_covariates
         self.use_observed_lib_size = use_observed_lib_size
         self.mmd_mode = mmd_mode
+        self.mmd_loss_weight = mmd_loss_weight
 
         if self.dispersion == "gene":
             self.px_r = torch.nn.Parameter(torch.randn(n_input))
@@ -461,11 +463,13 @@ class VAE(BaseModuleClass):
         x = tensors[_CONSTANTS.X_KEY]
         local_l_mean = tensors[_CONSTANTS.LOCAL_L_MEAN_KEY]
         local_l_var = tensors[_CONSTANTS.LOCAL_L_VAR_KEY]
+        batch_index = tensors[_CONSTANTS.BATCH_KEY]
 
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
         ql_m = inference_outputs["ql_m"]
         ql_v = inference_outputs["ql_v"]
+        z = inference_outputs["z"]
         px_rate = generative_outputs["px_rate"]
         px_r = generative_outputs["px_r"]
         px_dropout = generative_outputs["px_dropout"]
@@ -492,7 +496,12 @@ class VAE(BaseModuleClass):
 
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
 
-        loss = torch.mean(reconst_loss + weighted_kl_local)
+        mmd_loss = self._compute_mmd_loss(z, batch_index, self.mmd_mode)
+
+        loss = (
+            torch.mean(reconst_loss + weighted_kl_local)
+            + self.mmd_loss_weight * mmd_loss
+        )
 
         kl_local = dict(
             kl_divergence_l=kl_divergence_l, kl_divergence_z=kl_divergence_z
