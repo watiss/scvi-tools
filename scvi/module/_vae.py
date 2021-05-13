@@ -507,7 +507,7 @@ class VAE(BaseModuleClass):
             kl_divergence_l=kl_divergence_l, kl_divergence_z=kl_divergence_z
         )
         kl_global = 0.0
-        return LossRecorder(loss, reconst_loss, kl_local, kl_global)
+        return LossRecorder(loss, reconst_loss, kl_local, kl_global, mmd=mmd_loss)
 
     @torch.no_grad()
     def sample(
