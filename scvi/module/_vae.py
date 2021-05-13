@@ -101,6 +101,7 @@ class VAE(BaseModuleClass):
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_observed_lib_size: bool = True,
         var_activation: Optional[Callable] = None,
+        mmd_mode: Literal["normal", "fast"] = "normal",
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -113,6 +114,7 @@ class VAE(BaseModuleClass):
         self.latent_distribution = latent_distribution
         self.encode_covariates = encode_covariates
         self.use_observed_lib_size = use_observed_lib_size
+        self.mmd_mode = mmd_mode
 
         if self.dispersion == "gene":
             self.px_r = torch.nn.Parameter(torch.randn(n_input))
@@ -410,6 +412,44 @@ class VAE(BaseModuleClass):
         )
         mmd = all_kernels.mean()
         return mmd
+
+    def _compute_mmd_loss(
+        self, z: torch.Tensor, batch_indices: torch.Tensor, mode: str
+    ) -> torch.Tensor:
+        """
+        Computes the overall MMD loss associated with this set of samples. The overall MMD is the sum
+        of batch-wise MMD's, i.e. the MMD associated with the samples from ``z`` for each pair of sequential
+        batches in batch_indices.
+
+        Parameters
+        ----------
+        z
+            Set of samples to compute the overall MMD loss on
+        batch_indices
+            Batch indices corresponding to each sample in ``z``. Same length as ``z``.
+        mode
+            Whether to compute the approximate MMD ("fast" mode) or the exact MMD ("normal" mode)
+
+        Returns
+        -------
+        Tensor with one item containing the MMD loss for the samples in ``z``
+        """
+        mmd_loss = torch.tensor(0.0)
+        batches = torch.unique(batch_indices)
+        for b0, b1 in zip(batches, batches[1:]):
+            z0 = z[(batch_indices == b0).reshape(-1)]
+            z1 = z[(batch_indices == b1).reshape(-1)]
+            if mode == "normal":
+                mmd_loss += self._compute_mmd(z0, z1)
+            elif mode == "fast":
+                mmd_loss += self._compute_fast_mmd(z0, z1)
+            else:
+                raise ValueError(
+                    "Invalid mode passed in: {}. Must be one of 'normal' or 'fast'.".format(
+                        mode
+                    )
+                )
+        return mmd_loss
 
     def loss(
         self,
