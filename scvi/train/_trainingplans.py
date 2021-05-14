@@ -111,20 +111,25 @@ class TrainingPlan(pl.LightningModule):
         reconstruction_loss = scvi_loss.reconstruction_loss
         # pytorch lightning automatically backprops on "loss"
         self.log("train_loss", scvi_loss.loss, on_epoch=True)
-        return {
+        loss_dict = {
             "loss": scvi_loss.loss,
             "reconstruction_loss_sum": reconstruction_loss.sum(),
             "kl_local_sum": scvi_loss.kl_local.sum(),
             "kl_global": scvi_loss.kl_global,
             "n_obs": reconstruction_loss.shape[0],
         }
+        if hasattr(scvi_loss, "mmd"):
+            loss_dict["mmd_loss"] = scvi_loss.mmd
+        return loss_dict
 
     def training_epoch_end(self, outputs):
-        n_obs, elbo, rec_loss, kl_local = 0, 0, 0, 0
+        n_obs, elbo, rec_loss, kl_local, mmd_loss = 0, 0, 0, 0, 0
         for tensors in outputs:
             elbo += tensors["reconstruction_loss_sum"] + tensors["kl_local_sum"]
             rec_loss += tensors["reconstruction_loss_sum"]
             kl_local += tensors["kl_local_sum"]
+            if "mmd_loss" in tensors.keys():
+                mmd_loss += tensors["mmd_loss"]
             n_obs += tensors["n_obs"]
         # kl global same for each minibatch
         kl_global = outputs[0]["kl_global"]
@@ -132,26 +137,32 @@ class TrainingPlan(pl.LightningModule):
         self.log("elbo_train", elbo / n_obs)
         self.log("reconstruction_loss_train", rec_loss / n_obs)
         self.log("kl_local_train", kl_local / n_obs)
+        self.log("mmd_loss_train", mmd_loss / n_obs)
         self.log("kl_global_train", kl_global)
 
     def validation_step(self, batch, batch_idx):
         _, _, scvi_loss = self.forward(batch, loss_kwargs=self.loss_kwargs)
         reconstruction_loss = scvi_loss.reconstruction_loss
         self.log("validation_loss", scvi_loss.loss, on_epoch=True)
-        return {
+        loss_dict = {
             "reconstruction_loss_sum": reconstruction_loss.sum(),
             "kl_local_sum": scvi_loss.kl_local.sum(),
             "kl_global": scvi_loss.kl_global,
             "n_obs": reconstruction_loss.shape[0],
         }
+        if hasattr(scvi_loss, "mmd"):
+            loss_dict["mmd_loss"] = scvi_loss.mmd
+        return loss_dict
 
     def validation_epoch_end(self, outputs):
         """Aggregate validation step information."""
-        n_obs, elbo, rec_loss, kl_local = 0, 0, 0, 0
+        n_obs, elbo, rec_loss, kl_local, mmd_loss = 0, 0, 0, 0, 0
         for tensors in outputs:
             elbo += tensors["reconstruction_loss_sum"] + tensors["kl_local_sum"]
             rec_loss += tensors["reconstruction_loss_sum"]
             kl_local += tensors["kl_local_sum"]
+            if "mmd_loss" in tensors.keys():
+                mmd_loss += tensors["mmd_loss"]
             n_obs += tensors["n_obs"]
         # kl global same for each minibatch
         kl_global = outputs[0]["kl_global"]
@@ -159,6 +170,7 @@ class TrainingPlan(pl.LightningModule):
         self.log("elbo_validation", elbo / n_obs)
         self.log("reconstruction_loss_validation", rec_loss / n_obs)
         self.log("kl_local_validation", kl_local / n_obs)
+        self.log("mmd_loss_validation", mmd_loss / n_obs)
         self.log("kl_global_validation", kl_global)
 
     def configure_optimizers(self):
