@@ -78,6 +78,13 @@ class VAE(BaseModuleClass):
     var_activation
         Callable used to ensure positivity of the variational distributions' variance.
         When `None`, defaults to `torch.exp`.
+    mmd_mode
+        Describes how to compute the MMD component of the objective (loss) function.
+        One of:
+        * ``'normal'`` - Compute the exact MMD loss
+        * ``'fast'`` - Compute the approximate MMD loss
+    mmd_loss_weight
+        Describes the weight of the MMD component in the overall loss function.
     """
 
     def __init__(
@@ -436,7 +443,7 @@ class VAE(BaseModuleClass):
         -------
         Tensor with one item containing the MMD loss for the samples in ``z``
         """
-        mmd_loss = torch.tensor(0.0, device=z.device)
+        mmd_loss = 0.0
         batches = torch.unique(batch_indices)
         for b0, b1 in zip(batches, batches[1:]):
             z0 = z[(batch_indices == b0).reshape(-1)]
