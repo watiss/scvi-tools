@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
 """Main module."""
-import warnings
 from typing import Callable, Iterable, Optional
 
 import numpy as np
@@ -380,12 +379,6 @@ class VAE(BaseModuleClass):
 
         # z1_size and z2_size must match, otherwise pick their min
         batch_size = min(z1_size, z2_size)
-        if z1_size != z2_size:
-            warnings.warn(
-                "z1 and z2 don't have matching batch sizes, picking their min: {}.".format(
-                    batch_size
-                )
-            )
 
         # Drop a sample if batch_size is not even
         if batch_size % 2 != 0:
