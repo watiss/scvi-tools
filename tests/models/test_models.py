@@ -4,6 +4,7 @@ import tarfile
 import anndata
 import numpy as np
 import pytest
+import torch
 from pytorch_lightning.callbacks import LearningRateMonitor
 from scipy.sparse import csr_matrix
 from torch.nn import Softplus
@@ -51,6 +52,10 @@ def test_scvi(save_path):
     model.get_marginal_ll(n_mc_samples=3)
     model.get_reconstruction_error()
     model.get_normalized_expression(transform_batch="batch_1")
+
+    # validate default values of mmd_mode and mmd_loss_weight
+    assert model.module.mmd_mode == "normal"
+    assert model.module.mmd_loss_weight == 1.0
 
     adata2 = synthetic_iid()
     model.get_elbo(adata2)
@@ -180,6 +185,117 @@ def test_scvi(save_path):
         plan_kwargs={"reduce_lr_on_plateau": True},
     )
     assert "lr-Adam" in m.history.keys()
+
+    # test non-default mmd parameters and validate mmd is tracked in model history
+    model = SCVI(adata, n_latent=n_latent, mmd_mode="fast", mmd_loss_weight=10.0)
+    model.train(max_epochs=1, check_val_every_n_epoch=1, train_size=0.5)
+    assert model.is_trained is True
+    assert model.module.mmd_loss_weight == 10.0
+    assert model.module.mmd_mode == "fast"
+    z = model.get_latent_representation()
+    assert z.shape == (adata.shape[0], n_latent)
+    assert "mmd_loss_train" in model.history.keys()
+    assert "mmd_loss_validation" in model.history.keys()
+    assert len(model.history["mmd_loss_train"]) == 1
+    assert len(model.history["mmd_loss_validation"]) == 1
+    model.get_mmd_loss()
+
+
+def test_scvi_mmd(save_path):
+    adata = synthetic_iid()
+    model = SCVI(adata)
+
+    x = torch.randn(11, 4)
+    y = torch.randn(12, 4)
+
+    # compute the mmd using the model
+    model_mmd = model.module._compute_mmd(x, y)
+    # compute the mmd manually without using vectorization
+    m = x.size(0)
+    sum_x = 0
+    for i in range(m):
+        for j in range(m):
+            diff_norm = (x[i, :] - x[j, :]).pow(2).sum()
+            sum_x += torch.exp(-diff_norm)
+    mean_x = sum_x / (m ** 2)
+    n = y.size(0)
+    sum_y = 0
+    for i in range(n):
+        for j in range(n):
+            diff_norm = (y[i, :] - y[j, :]).pow(2).sum()
+            sum_y += torch.exp(-diff_norm)
+    mean_y = sum_y / (n ** 2)
+    sum_xy = 0
+    for i in range(m):
+        for j in range(n):
+            diff_norm = (x[i, :] - y[j, :]).pow(2).sum()
+            sum_xy += torch.exp(-diff_norm)
+    mean_xy = sum_xy / (m * n)
+    manual_mmd = mean_x + mean_y - 2 * mean_xy
+    # validate model and manual mmd's match
+    assert round(model_mmd.item(), 3) == round(manual_mmd.item(), 3)
+
+    # compute the fast mmd using the model
+    model_mmd = model.module._compute_fast_mmd(x, y)
+    # compute the fast mmd manually without using vectorization
+    m = min(x.size(0), y.size(0))
+    sum = 0
+    for i in range(m // 2):
+        x_2i = x[2 * i, :]
+        y_2i = y[2 * i, :]
+        x_2i_1 = x[2 * i + 1, :]
+        y_2i_1 = y[2 * i + 1, :]
+        first_term = (x_2i - x_2i_1).pow(2).sum()
+        second_term = (y_2i - y_2i_1).pow(2).sum()
+        third_term = (x_2i - y_2i_1).pow(2).sum()
+        fourth_term = (x_2i_1 - y_2i).pow(2).sum()
+        torch_sum = (
+            torch.exp(-first_term)
+            + torch.exp(-second_term)
+            - torch.exp(-third_term)
+            - torch.exp(-fourth_term)
+        )
+        sum += torch_sum.item()
+    manual_mmd = sum / (m // 2)
+    # validate model and manual fast mmd's match
+    assert round(model_mmd.item(), 3) == round(manual_mmd, 3)
+
+    # validate non-matching size across the second dimension raises ValueError
+    x = torch.randn(11, 3)
+    y = torch.randn(12, 4)
+    with pytest.raises(ValueError):
+        model.module._compute_mmd(x, y)
+    with pytest.raises(ValueError):
+        model.module._compute_fast_mmd(x, y)
+
+    # validate mmd loss is 0 when all batches are identical
+    adata = synthetic_iid(n_batches=1)
+    model = SCVI(adata)
+    model.train(max_epochs=1)
+    assert "mmd_loss_train" in model.history.keys()
+    assert len(model.history["mmd_loss_train"]) == 1
+    assert model.history["mmd_loss_train"].to_numpy()[0][0] == 0.0
+
+    # validate ValueError is raised if mmd mode is unrecognized
+    adata = synthetic_iid(n_batches=2)
+    model = SCVI(adata, mmd_mode="unknown")
+    with pytest.raises(ValueError):
+        model.train(max_epochs=1)
+
+    # validate mmd loss is computed correctly
+    z = torch.randn(8, 4)
+    batches = torch.tensor([1, 1, 1, 2, 2, 2, 3, 3])
+    model_mmd = model.module._compute_mmd_loss(z, batches, "normal")
+    # compute the expected mmd loss value
+    z0, z1, z2 = z[:3], z[3:6], z[6:]
+    expected_mmd = model.module._compute_mmd(z0, z1) + model.module._compute_mmd(z1, z2)
+    assert round(model_mmd.item(), 3) == round(expected_mmd.item(), 3)
+    # same with fast mode
+    model_mmd = model.module._compute_mmd_loss(z, batches, "fast")
+    expected_mmd = model.module._compute_fast_mmd(
+        z0, z1
+    ) + model.module._compute_fast_mmd(z1, z2)
+    assert round(model_mmd.item(), 3) == round(expected_mmd.item(), 3)
 
 
 def test_scvi_sparse(save_path):

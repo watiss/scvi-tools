@@ -436,7 +436,7 @@ class VAE(BaseModuleClass):
         -------
         Tensor with one item containing the MMD loss for the samples in ``z``
         """
-        mmd_loss = 0.0
+        mmd_loss = torch.tensor(0.0, device=z.device)
         batches = torch.unique(batch_indices)
         for b0, b1 in zip(batches, batches[1:]):
             z0 = z[(batch_indices == b0).reshape(-1)]
