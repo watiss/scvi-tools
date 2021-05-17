@@ -338,8 +338,7 @@ class VAE(BaseModuleClass):
 
     def _compute_mmd(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
         """
-        Computes the Maximum Mean Discrepancy (MMD) of ``z1`` and ``z2``.
-        TODO cite paper
+        Computes the Maximum Mean Discrepancy (MMD) of ``z1`` and ``z2`` as described in [Gretton12]_.
         Based on https://github.com/napsternxg/pytorch-practice/blob/master/Pytorch%20-%20MMD%20VAE.ipynb
 
         Parameters
