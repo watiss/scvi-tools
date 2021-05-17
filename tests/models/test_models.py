@@ -198,6 +198,8 @@ def test_scvi(save_path):
     assert "mmd_loss_validation" in model.history.keys()
     assert len(model.history["mmd_loss_train"]) == 1
     assert len(model.history["mmd_loss_validation"]) == 1
+    assert not np.isnan(model.history["mmd_loss_train"].values[0][0])
+    assert not np.isnan(model.history["mmd_loss_validation"].values[0][0])
     model.get_mmd_loss()
 
 
@@ -274,7 +276,7 @@ def test_scvi_mmd(save_path):
     model.train(max_epochs=1)
     assert "mmd_loss_train" in model.history.keys()
     assert len(model.history["mmd_loss_train"]) == 1
-    assert model.history["mmd_loss_train"].to_numpy()[0][0] == 0.0
+    assert model.history["mmd_loss_train"].values[0][0] == 0.0
 
     # validate ValueError is raised if mmd mode is unrecognized
     adata = synthetic_iid(n_batches=2)
