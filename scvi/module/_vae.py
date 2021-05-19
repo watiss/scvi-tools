@@ -393,24 +393,22 @@ class VAE(BaseModuleClass):
                 "z2_d={}.".format(z1.size(1), z2.size(1))
             )
 
-        # zi_even contains every other sample in zi starting at 0
-        z1_even = z1[: batch_size - 1 : 2, :]
-        z1_odd = z1[1:batch_size:2, :]
-        z2_even = z2[: batch_size - 1 : 2, :]
-        z2_odd = z2[1:batch_size:2, :]
+        # The order of the cells does not matter here (and is in fact random).
+        # Thus we can compute the h(.) terms for any pairs of vectors from z1
+        # and z2. Here we make these pairs from the first and second halves of
+        # these two tensors.
+        z1_first_half = z1[: batch_size // 2, :]
+        z1_second_half = z1[batch_size // 2 :, :]
+        z2_first_half = z2[: batch_size // 2, :]
+        z2_second_half = z2[batch_size // 2 :, :]
 
         # Compute the kernels
-        z1_even_odd_kernels = torch.exp(-((z1_even - z1_odd).pow(2).sum(1)))
-        z2_even_odd_kernels = torch.exp(-((z2_even - z2_odd).pow(2).sum(1)))
-        z1_even_z2_odd_kernels = torch.exp(-((z1_even - z2_odd).pow(2).sum(1)))
-        z1_odd_z2_even_kernels = torch.exp(-((z1_odd - z2_even).pow(2).sum(1)))
+        z1_z1_kernels = torch.exp(-((z1_first_half - z1_second_half).pow(2).sum(1)))
+        z2_z2_kernels = torch.exp(-((z2_first_half - z2_second_half).pow(2).sum(1)))
+        z1_z2_kernels = torch.exp(-((z1_first_half - z2_second_half).pow(2).sum(1)))
+        z2_z1_kernels = torch.exp(-((z1_second_half - z2_first_half).pow(2).sum(1)))
 
-        all_kernels = (
-            z1_even_odd_kernels
-            + z2_even_odd_kernels
-            - z1_even_z2_odd_kernels
-            - z1_odd_z2_even_kernels
-        )
+        all_kernels = z1_z1_kernels + z2_z2_kernels - z1_z2_kernels - z2_z1_kernels
         mmd = all_kernels.mean()
         return mmd
 

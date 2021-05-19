@@ -243,14 +243,14 @@ def test_scvi_mmd(save_path):
     m = min(x.size(0), y.size(0))
     sum = 0
     for i in range(m // 2):
-        x_2i = x[2 * i, :]
-        y_2i = y[2 * i, :]
-        x_2i_1 = x[2 * i + 1, :]
-        y_2i_1 = y[2 * i + 1, :]
-        first_term = (x_2i - x_2i_1).pow(2).sum()
-        second_term = (y_2i - y_2i_1).pow(2).sum()
-        third_term = (x_2i - y_2i_1).pow(2).sum()
-        fourth_term = (x_2i_1 - y_2i).pow(2).sum()
+        x_i = x[i, :]
+        y_i = y[i, :]
+        x_i_m2 = x[i + m // 2, :]
+        y_i_m2 = y[i + m // 2, :]
+        first_term = (x_i - x_i_m2).pow(2).sum()
+        second_term = (y_i - y_i_m2).pow(2).sum()
+        third_term = (x_i - y_i_m2).pow(2).sum()
+        fourth_term = (x_i_m2 - y_i).pow(2).sum()
         torch_sum = (
             torch.exp(-first_term)
             + torch.exp(-second_term)
