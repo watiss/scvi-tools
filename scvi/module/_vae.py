@@ -23,7 +23,7 @@ class VAE(BaseModuleClass):
     """
     Variational auto-encoder model.
 
-    This is an implementation of the scVI model descibed in [Lopez18]_
+    This is an implementation of the scVI model described in [Lopez18]_
 
     Parameters
     ----------
@@ -77,6 +77,13 @@ class VAE(BaseModuleClass):
     var_activation
         Callable used to ensure positivity of the variational distributions' variance.
         When `None`, defaults to `torch.exp`.
+    mmd_mode
+        Describes how to compute the MMD component of the objective (loss) function.
+        One of:
+        * ``'normal'`` - Compute the exact MMD loss
+        * ``'fast'`` - Compute the approximate MMD loss
+    mmd_loss_weight
+        Describes the weight of the MMD component in the overall loss function.
     """
 
     def __init__(
@@ -100,6 +107,8 @@ class VAE(BaseModuleClass):
         use_layer_norm: Literal["encoder", "decoder", "none", "both"] = "none",
         use_observed_lib_size: bool = True,
         var_activation: Optional[Callable] = None,
+        mmd_mode: Literal["normal", "fast"] = "normal",
+        mmd_loss_weight: float = 1.0,
     ):
         super().__init__()
         self.dispersion = dispersion
@@ -112,6 +121,8 @@ class VAE(BaseModuleClass):
         self.latent_distribution = latent_distribution
         self.encode_covariates = encode_covariates
         self.use_observed_lib_size = use_observed_lib_size
+        self.mmd_mode = mmd_mode
+        self.mmd_loss_weight = mmd_loss_weight
 
         if self.dispersion == "gene":
             self.px_r = torch.nn.Parameter(torch.randn(n_input))
@@ -289,6 +300,156 @@ class VAE(BaseModuleClass):
             px_scale=px_scale, px_r=px_r, px_rate=px_rate, px_dropout=px_dropout
         )
 
+    def _compute_mmd_kernels(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the kernels for the given tensors, which can be
+        used to compute their MMD. The kernel used here is a
+        Gaussian kernel with :math:`\gamma`=1.
+
+        Parameters
+        ----------
+        z1
+            First tensor
+        z2
+            Second tensor
+
+        Returns
+        -------
+        Tensor containing the kernels of ``z1`` and ``z2``.
+        """
+        z1_size = z1.size(0)
+        z2_size = z2.size(0)
+
+        d = z1.size(1)
+        if d != z2.size(1):
+            raise ValueError(
+                "z1 and z2 must be defined on the same space, "
+                "but input was: z1_d={} while "
+                "z2_d={}.".format(z1.size(1), z2.size(1))
+            )
+
+        z1 = z1.unsqueeze(1)  # (z1_size, 1, d)
+        z2 = z2.unsqueeze(0)  # (1, z2_size, d)
+        z1 = z1.expand(z1_size, z2_size, d)
+        z2 = z2.expand(z1_size, z2_size, d)
+
+        exp_term = (z1 - z2).pow(2).sum(dim=2)  # (z1_size, z2_size)
+        return torch.exp(-exp_term)
+
+    def _compute_mmd(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the Maximum Mean Discrepancy (MMD) of ``z1`` and ``z2`` as described in [Gretton12]_.
+        Based on https://github.com/napsternxg/pytorch-practice/blob/master/Pytorch%20-%20MMD%20VAE.ipynb
+
+        Parameters
+        ----------
+        z1
+            First tensor
+        z2
+            Second tensor
+
+        Returns
+        -------
+        Tensor with one item containing the MMD of ``z1`` and ``z2``.
+        """
+        k_z1_z1 = self._compute_mmd_kernels(z1, z1)
+        k_z2_z2 = self._compute_mmd_kernels(z2, z2)
+        k_z1_z2 = self._compute_mmd_kernels(z1, z2)
+        mmd = k_z1_z1.mean() + k_z2_z2.mean() - 2 * k_z1_z2.mean()
+        return mmd
+
+    def _compute_fast_mmd(self, z1: torch.Tensor, z2: torch.Tensor) -> torch.Tensor:
+        """
+        Computes a fast approximation of the MMD. See `_compute_mmd`.
+
+        Parameters
+        ----------
+        z1
+            First tensor
+        z2
+            Second tensor
+
+        Returns
+        -------
+        Tensor with one item containing an approximation of the MMD of ``z1`` and ``z2``.
+        """
+        z1_size = z1.size(0)
+        z2_size = z2.size(0)
+
+        # z1_size and z2_size must match, otherwise pick their min
+        batch_size = min(z1_size, z2_size)
+
+        # Drop a sample if batch_size is not even
+        if batch_size % 2 != 0:
+            batch_size -= 1
+
+        z1 = z1[:batch_size, :]
+        z2 = z2[:batch_size, :]
+
+        if z1.size(1) != z2.size(1):
+            raise ValueError(
+                "z1 and z2 must be defined on the same space, "
+                "but input was: z1_d={} while "
+                "z2_d={}.".format(z1.size(1), z2.size(1))
+            )
+
+        # The order of the cells does not matter here (and is in fact random).
+        # Thus we can compute the h(.) terms for any pairs of vectors from z1
+        # and z2. Here we make these pairs from the first and second halves of
+        # these two tensors.
+        z1_first_half = z1[: batch_size // 2, :]
+        z1_second_half = z1[batch_size // 2 :, :]
+        z2_first_half = z2[: batch_size // 2, :]
+        z2_second_half = z2[batch_size // 2 :, :]
+
+        # Compute the kernels
+        z1_z1_kernels = torch.exp(-((z1_first_half - z1_second_half).pow(2).sum(1)))
+        z2_z2_kernels = torch.exp(-((z2_first_half - z2_second_half).pow(2).sum(1)))
+        z1_z2_kernels = torch.exp(-((z1_first_half - z2_second_half).pow(2).sum(1)))
+        z2_z1_kernels = torch.exp(-((z1_second_half - z2_first_half).pow(2).sum(1)))
+
+        all_kernels = z1_z1_kernels + z2_z2_kernels - z1_z2_kernels - z2_z1_kernels
+        mmd = all_kernels.mean()
+        return mmd
+
+    def _compute_mmd_loss(
+        self, z: torch.Tensor, batch_indices: torch.Tensor, mode: str
+    ) -> torch.Tensor:
+        """
+        Computes the overall MMD loss associated with this set of samples. The overall MMD is the sum
+        of batch-wise MMD's, i.e. the MMD associated with the samples from ``z`` for each pair of sequential
+        batches in batch_indices.
+
+        Parameters
+        ----------
+        z
+            Set of samples to compute the overall MMD loss on
+        batch_indices
+            Batch indices corresponding to each sample in ``z``. Same length as ``z``.
+        mode
+            Whether to compute the approximate MMD ("fast" mode) or the exact MMD ("normal" mode)
+
+        Returns
+        -------
+        Tensor with one item containing the MMD loss for the samples in ``z``
+        """
+        mmd_loss = torch.tensor(0.0, device=z.device)
+        batches = torch.unique(batch_indices)
+        for b0, b1 in zip(batches, batches[1:]):
+            z0 = z[(batch_indices == b0).reshape(-1)]
+            z1 = z[(batch_indices == b1).reshape(-1)]
+            if mode == "normal":
+                mmd_loss += self._compute_mmd(z0, z1)
+            elif mode == "fast":
+                mmd_loss += self._compute_fast_mmd(z0, z1)
+            else:
+                raise ValueError(
+                    "Invalid mode passed in: {}. Must be one of 'normal' or 'fast'.".format(
+                        mode
+                    )
+                )
+        return mmd_loss
+
     def loss(
         self,
         tensors,
@@ -299,11 +460,13 @@ class VAE(BaseModuleClass):
         x = tensors[_CONSTANTS.X_KEY]
         local_l_mean = tensors[_CONSTANTS.LOCAL_L_MEAN_KEY]
         local_l_var = tensors[_CONSTANTS.LOCAL_L_VAR_KEY]
+        batch_index = tensors[_CONSTANTS.BATCH_KEY]
 
         qz_m = inference_outputs["qz_m"]
         qz_v = inference_outputs["qz_v"]
         ql_m = inference_outputs["ql_m"]
         ql_v = inference_outputs["ql_v"]
+        z = inference_outputs["z"]
         px_rate = generative_outputs["px_rate"]
         px_r = generative_outputs["px_r"]
         px_dropout = generative_outputs["px_dropout"]
@@ -330,13 +493,18 @@ class VAE(BaseModuleClass):
 
         weighted_kl_local = kl_weight * kl_local_for_warmup + kl_local_no_warmup
 
-        loss = torch.mean(reconst_loss + weighted_kl_local)
+        mmd_loss = self._compute_mmd_loss(z, batch_index, self.mmd_mode)
+
+        loss = (
+            torch.mean(reconst_loss + weighted_kl_local)
+            + self.mmd_loss_weight * mmd_loss
+        )
 
         kl_local = dict(
             kl_divergence_l=kl_divergence_l, kl_divergence_z=kl_divergence_z
         )
         kl_global = 0.0
-        return LossRecorder(loss, reconst_loss, kl_local, kl_global)
+        return LossRecorder(loss, reconst_loss, kl_local, kl_global, mmd=mmd_loss)
 
     @torch.no_grad()
     def sample(

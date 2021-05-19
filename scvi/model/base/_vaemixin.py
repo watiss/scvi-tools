@@ -120,6 +120,45 @@ class VAEMixin:
         return reconstruction_error
 
     @torch.no_grad()
+    def get_mmd_loss(
+        self,
+        adata: Optional[AnnData] = None,
+        indices: Optional[Sequence[int]] = None,
+        batch_size: Optional[int] = None,
+    ) -> float:
+        """
+        Computes the total MMD loss for the data over the given indices sliced by
+        the given batch size.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
+            AnnData object used to initialize the model.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        batch_size
+            Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+
+        Returns
+        -------
+        Float value containing the total MMD loss for the data
+        """
+        adata = self._validate_anndata(adata)
+        scdl = self._make_data_loader(
+            adata=adata, indices=indices, batch_size=batch_size
+        )
+
+        total_mmd = 0.0
+        for tensors in scdl:
+            _, _, scvi_loss = self.module(tensors)
+            if hasattr(scvi_loss, "mmd"):
+                total_mmd += scvi_loss.mmd.item()
+
+        n_samples = len(scdl.indices)
+        return total_mmd / n_samples
+
+    @torch.no_grad()
     def get_latent_representation(
         self,
         adata: Optional[AnnData] = None,

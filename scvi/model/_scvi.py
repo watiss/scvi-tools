@@ -47,6 +47,13 @@ class SCVI(
 
         * ``'normal'`` - Normal distribution
         * ``'ln'`` - Logistic normal distribution (Normal(0, I) transformed by softmax)
+    mmd_mode
+        Describes how to compute the MMD component of the objective (loss) function.
+        One of:
+        * ``'normal'`` - Compute the exact MMD loss
+        * ``'fast'`` - Compute the approximate MMD loss
+    mmd_loss_weight
+        Describes the weight of the MMD component in the overall loss function.
     **model_kwargs
         Keyword args for :class:`~scvi.module.VAE`
 
@@ -79,6 +86,8 @@ class SCVI(
         dispersion: Literal["gene", "gene-batch", "gene-label", "gene-cell"] = "gene",
         gene_likelihood: Literal["zinb", "nb", "poisson"] = "zinb",
         latent_distribution: Literal["normal", "ln"] = "normal",
+        mmd_mode: Literal["normal", "fast"] = "normal",
+        mmd_loss_weight: float = 1.0,
         **model_kwargs,
     ):
         super(SCVI, self).__init__(adata)
@@ -101,11 +110,13 @@ class SCVI(
             dispersion=dispersion,
             gene_likelihood=gene_likelihood,
             latent_distribution=latent_distribution,
+            mmd_mode=mmd_mode,
+            mmd_loss_weight=mmd_loss_weight,
             **model_kwargs,
         )
         self._model_summary_string = (
             "SCVI Model with the following params: \nn_hidden: {}, n_latent: {}, n_layers: {}, dropout_rate: "
-            "{}, dispersion: {}, gene_likelihood: {}, latent_distribution: {}"
+            "{}, dispersion: {}, gene_likelihood: {}, latent_distribution: {}, mmd_mode: {}, mmd_loss_weight: {}"
         ).format(
             n_hidden,
             n_latent,
@@ -114,5 +125,7 @@ class SCVI(
             dispersion,
             gene_likelihood,
             latent_distribution,
+            mmd_mode,
+            mmd_loss_weight,
         )
         self.init_params_ = self._get_init_params(locals())
